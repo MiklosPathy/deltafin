@@ -257,6 +257,41 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
     LibTorch root is a manually extracted `torch-2.13.0+cu130` wheel supplied
     through `DELTAFIN_TORCH_ROOT`. Step 5 (bootstrap pin) and the GPU CI leg of
     step 6 remain.
+
+    ### 29b. Intel XPU provider (APU), full implementation
+
+    Goal: run K3 on the Intel Arc/iGPU via PyTorch's `at::kXPU` backend, so the
+    ~86 GB/token working set stays in shared system memory instead of streaming
+    over PCIe from a 16 GB discrete GPU. Verified feasible on the dev box
+    (Intel iGPU DEV_7D67, Xe2 64 EU, 139 GB shared): `torch.xpu` works,
+    `at::kXPU` runs `linear`/`einsum`/`softmax`/`silu`/`topk`/`gather`/
+    `_weight_int8pack_mm`/`scaled_dot_product_attention`, and a `-fsycl` binary
+    can host a SYCL kernel and torch_xpu together.
+
+    SYCL tooling is installed at `.deltafin/sycl-dpcpp` (portable DPC++
+    nightly-2026-10-07, `bin/clang++.exe -fsycl`). Two integration invariants:
+    the nightly SYCL runtime is newer than the pip 2026.0 `sycl9.dll` and is
+    backward-compatible with torch_xpu, so one runtime (the nightly's) must win
+    the DLL search; and `at::xpu::getCurrentDeviceProperties` must be referenced
+    (anchor) so the linker keeps the `torch_xpu.dll` import and the XPU ATen
+    kernels register.
+
+    - [ ] 1. **Device plumbing + ATen-XPU attention.** Rust `Device::Xpu` +
+      `xpu`/`xpu:N` config, ABI `DELTAFIN_PROVIDER_DEVICE_XPU_V1`,
+      `provider_device.h` XPU branch, memory snapshot via
+      `c10::xpu::XPUCachingAllocator`, build-graph XPU flavor (link
+      `torch_xpu`/`c10_xpu`, deploy the SYCL/oneMKL/UR runtime DLLs, anchor
+      torch_xpu). Attention/dense/target run on XPU through ATen; experts use the
+      exact CPU MXFP4 fallback. This is the first measurable number.
+    - [ ] 2. **XPU MXFP4 expert kernel + resident expert cache (SYCL).** Port the
+      MoE GEMV/MoE kernels to SYCL, add an `XpuMxfp4` `MoeExpertBackend`, and a
+      provider-owned device expert cache so resident experts never cross the bus.
+    - [ ] 3. **XPU BF16 spine kernel (SYCL).** Port the RAW_BF16 projection kernel
+      so original-BF16 K3 runs on XPU without expanding weights to FP32.
+
+    Builds on 29a's provider patterns; the XPU flavor is a sibling of the CUDA
+    one, not a re-port of the CPU provider.
+
 30. **Context beyond today's bound.**
     - The expanded fp32 MLA cache is 512 MiB per layer.
     - Exact compact MLA (C30) was rejected because it is not bit-exact.
