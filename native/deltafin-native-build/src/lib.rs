@@ -60,6 +60,7 @@ const PROVIDER_CPP_SOURCES: &[&str] = &[
     "provider_pilot.cpp",
     "provider_cuda_moe.cpp",
     "provider_spine_bf16_cuda.cpp",
+    "provider_xpu.cpp",
     "provider_moe.cpp",
     "provider_qwen.cpp",
     "provider_target.cpp",
@@ -99,6 +100,7 @@ pub const PRODUCTION_PROVIDER_SOURCES: &[&str] = &[
     "native/provider_gate/provider_spine_bf16_cuda.h",
     "native/provider_gate/provider_spine_bf16_cuda.cpp",
     "native/provider_gate/provider_spine_bf16_cuda.cu",
+    "native/provider_gate/provider_xpu.cpp",
     "native/provider_gate/provider_moe.h",
     "native/provider_gate/provider_moe.cpp",
     "native/provider_gate/provider_qwen.h",
@@ -694,10 +696,25 @@ pub fn run_production_build() {
                 println!("cargo:rustc-env=DELTAFIN_LIBTORCH_CUDA_MAJOR={major}");
             }
             GpuRuntime::Rocm => println!("cargo:rustc-env=DELTAFIN_LIBTORCH_HIP=1"),
+            GpuRuntime::Xpu => println!("cargo:rustc-env=DELTAFIN_LIBTORCH_XPU=1"),
         }
     }
     link_optional(&artifacts.torch_lib, "torch_cuda_linalg");
     link_required(&artifacts.torch_lib, "c10");
+
+    let torch_xpu = library_file(&artifacts.torch_lib, "torch_xpu");
+    let c10_xpu = library_file(&artifacts.torch_lib, "c10_xpu");
+    if torch_xpu.is_some() != c10_xpu.is_some() {
+        panic!(
+            "selected native PyTorch root has an incomplete XPU pair in {}: libtorch_xpu and libc10_xpu must either both exist or both be absent",
+            artifacts.torch_lib.display()
+        );
+    }
+    if torch_xpu.is_some() {
+        println!("cargo:rustc-link-lib=dylib=torch_xpu");
+        println!("cargo:rustc-link-lib=dylib=c10_xpu");
+        println!("cargo:rustc-env=DELTAFIN_LIBTORCH_XPU=1");
+    }
 
     if let Some(provider) = &artifacts.cuda_provider {
         println!(
@@ -787,15 +804,16 @@ pub fn run_production_build() {
     if target_os() == "windows" {
         // Windows has no RPATH: the loader finds LibTorch's DLLs beside the
         // executable, so the authenticated ones are placed there. A CUDA build
-        // additionally needs the toolkit's `cudart64_*` runtime beside it.
-        // The toolkit's `cudart64_*` is placed first so it wins the name
-        // collision with any `cudart64_*` a CUDA wheel may bundle: the provider
-        // is linked against the toolkit's import library, and a newer minor is
-        // backward compatible with what LibTorch was built against. The import
-        // library and the DLL may sit in sibling directories (`lib\x64` and
-        // `bin\x64`), so both are offered to the deployer.
+        // additionally needs the toolkit's `cudart64_*` runtime beside it; an
+        // XPU build needs the SYCL/oneMKL/UR runtime.
         let mut sources = Vec::new();
         if let Some(provider) = &artifacts.cuda_provider {
+            // The toolkit's `cudart64_*` is placed first so it wins the name
+            // collision with any `cudart64_*` a CUDA wheel may bundle: the
+            // provider is linked against the toolkit's import library, and a
+            // newer minor is backward compatible with what LibTorch was built
+            // against. The import library and the DLL may sit in sibling
+            // directories (`lib\x64` and `bin\x64`), so both are offered.
             sources.push(provider.runtime_directory.clone());
             if let Some(root) = provider.runtime_directory.parent().and_then(Path::parent) {
                 for extra in ["bin/x64", "bin"] {
@@ -810,6 +828,24 @@ pub fn run_production_build() {
                 sources.push(driver);
             }
         }
+        if artifacts.gpu_runtime == Some(GpuRuntime::Xpu) {
+            // The SYCL toolchain's runtime wins the `sycl9.dll` name over any
+            // copy a pip `intel-sycl-rt` install would place; it is newer and
+            // backward compatible with the XPU LibTorch.
+            if let Some(root) = sycl_root() {
+                for extra in ["bin", "lib"] {
+                    let directory = root.join(extra);
+                    if directory.is_dir() {
+                        sources.push(directory);
+                    }
+                }
+            }
+            for directory in xpu_runtime_directories() {
+                if directory.is_dir() {
+                    sources.push(directory);
+                }
+            }
+        }
         sources.push(artifacts.torch_lib.clone());
         deploy_runtime_libraries(&sources, &PathBuf::from(required_env("OUT_DIR")));
     } else {
@@ -818,6 +854,20 @@ pub fn run_production_build() {
             artifacts.torch_lib.display()
         );
     }
+}
+
+/// The portable DPC++/SYCL toolchain root, when an XPU build supplies one.
+fn sycl_root() -> Option<PathBuf> {
+    env::var_os("DELTAFIN_SYCL_ROOT").map(PathBuf::from)
+}
+
+/// Directories holding the Intel XPU runtime DLLs (SYCL adapters, oneMKL,
+/// unified-runtime loader) that are not part of the SYCL toolchain. A
+/// semicolon-separated `DELTAFIN_XPU_RUNTIME` list.
+fn xpu_runtime_directories() -> Vec<PathBuf> {
+    env::var_os("DELTAFIN_XPU_RUNTIME")
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_default()
 }
 
 /// `-Wl,-rpath` is a GNU-ld spelling; Windows `link.exe` rejects it and relies
@@ -1289,6 +1339,9 @@ fn build_provider_artifacts(
     if cuda_provider.is_some() {
         definitions.push("DELTAFIN_HAVE_CUDA_PROVIDER_V1=1");
     }
+    if gpu_runtime == Some(GpuRuntime::Xpu) {
+        definitions.push("DELTAFIN_HAVE_XPU_PROVIDER_V1=1");
+    }
     if cuda.is_some() {
         definitions.extend([
             "DELTAFIN_HAVE_CUDA_MOE_V1=1",
@@ -1323,13 +1376,22 @@ fn build_provider_artifacts(
     // the independent units are compiled concurrently. Objects keep the order
     // of this list, so the archive is the same whatever the schedule.
     let mut jobs: Vec<CompileJob> = Vec::new();
+    // The device runtime headers a provider translation unit needs: the CUDA
+    // toolkit include for a CUDA build, the SYCL toolchain include for an XPU
+    // build (its `c10/xpu` headers pull `<sycl/sycl.hpp>`).
+    let device_include: Option<PathBuf> = cuda_provider
+        .as_ref()
+        .map(|provider| provider.include_directory.clone())
+        .or_else(|| {
+            (gpu_runtime == Some(GpuRuntime::Xpu))
+                .then(|| sycl_root().map(|root| root.join("include")))
+                .flatten()
+        });
     for source in PROVIDER_CPP_SOURCES {
         jobs.push(CompileJob {
             kind: CompileKind::Cpp {
                 generated_include: (host_os == "macos").then_some(generated_include.as_path()),
-                cuda_include: cuda_provider
-                    .as_ref()
-                    .map(|provider| provider.include_directory.as_path()),
+                cuda_include: device_include.as_deref(),
                 objective_cpp: false,
             },
             source: provider_source.join(source),
@@ -3641,9 +3703,15 @@ fn build_cuda_kernel(
         }
         return None;
     }
+    // XPU has no NVCC/HIP translation units; its kernels are SYCL and are
+    // handled by the XPU flavor.
+    if runtime == GpuRuntime::Xpu {
+        return None;
+    }
     let plan = match runtime {
         GpuRuntime::Cuda(major) => plan_cuda_kernel_build(major, mode, guard, emit_cargo_metadata)?,
         GpuRuntime::Rocm => plan_hip_kernel_build(mode, guard, emit_cargo_metadata)?,
+        GpuRuntime::Xpu => unreachable!("handled above"),
     };
     let object = native_build.join(object_file_name("cuda_moe_kernels"));
     let spine_object = native_build.join(object_file_name("provider_spine_bf16_cuda_kernel"));
@@ -4998,6 +5066,9 @@ fn shared_library_name(name: &str) -> String {
 enum GpuRuntime {
     Cuda(u8),
     Rocm,
+    /// Intel XPU (`at::kXPU`), a distinct ATen backend with a `torch_xpu` /
+    /// `c10_xpu` pair and no cudart.
+    Xpu,
 }
 
 /// The loadable module a runtime dependency scan must read: the shared object
@@ -5017,6 +5088,21 @@ fn detect_gpu_runtime(torch_lib: &Path) -> Option<GpuRuntime> {
     let host_os = target_os();
     if host_os != "linux" && host_os != "windows" {
         return None;
+    }
+    // XPU is a distinct ATen backend: its own `torch_xpu`/`c10_xpu` pair and no
+    // cudart, so detect it before the CUDA/ROCm dependency scan.
+    let xpu_libraries = [
+        library_file(torch_lib, "c10_xpu"),
+        library_file(torch_lib, "torch_xpu"),
+    ];
+    if xpu_libraries.iter().any(Option::is_some) {
+        if xpu_libraries.iter().any(Option::is_none) {
+            panic!(
+                "selected native PyTorch root has an incomplete XPU pair in {}",
+                torch_lib.display()
+            );
+        }
+        return Some(GpuRuntime::Xpu);
     }
     let cuda_libraries = [
         library_file(torch_lib, "c10_cuda"),

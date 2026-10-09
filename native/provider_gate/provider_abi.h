@@ -31,6 +31,7 @@ enum DeltafinProviderDeviceV1 {
   DELTAFIN_PROVIDER_DEVICE_CPU_V1 = 1,
   DELTAFIN_PROVIDER_DEVICE_MPS_V1 = 2,
   DELTAFIN_PROVIDER_DEVICE_CUDA_V1 = 3,
+  DELTAFIN_PROVIDER_DEVICE_XPU_V1 = 4,
 };
 
 enum DeltafinProviderCheckV1 {
@@ -49,6 +50,10 @@ enum DeltafinProviderFeatureV1 {
   DELTAFIN_PROVIDER_FEATURE_CUDA_MOE_V1 = 1u << 0,
   /* Exact RAW_BF16 CUDA decode/GEMV kernel and carrier are both linked. */
   DELTAFIN_PROVIDER_FEATURE_CUDA_EXACT_BF16_V1 = 1u << 1,
+  /* SYCL MXFP4 expert kernel plus the XPU expert adapter are both linked. */
+  DELTAFIN_PROVIDER_FEATURE_XPU_MOE_V1 = 1u << 2,
+  /* Exact RAW_BF16 SYCL decode/GEMV kernel and carrier are both linked. */
+  DELTAFIN_PROVIDER_FEATURE_XPU_EXACT_BF16_V1 = 1u << 3,
 };
 
 enum DeltafinProviderSessionFlagV1 {
@@ -144,7 +149,8 @@ typedef struct DeltafinProviderInventoryV1 {
   uint32_t mps_available;
   uint32_t cuda_device_count;
   uint32_t provider_features;
-  uint32_t reserved[10];
+  uint32_t xpu_device_count;
+  uint32_t reserved[9];
   char libtorch_version[32];
 } DeltafinProviderInventoryV1;
 

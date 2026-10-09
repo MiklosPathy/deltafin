@@ -3977,10 +3977,15 @@ extern "C" int32_t deltafin_provider_memory_snapshot_v1(
       throw std::logic_error(
           "MPS provider selected in a non-Apple provider build");
 #endif
-    } else if (session->selected.device.is_cuda()) {
+    } else if (
+        session->selected.device.is_cuda() ||
+        session->selected.device.is_xpu()) {
       const auto snapshot =
-          deltafin::provider_internal::cuda_provider_memory_snapshot(
-              session->selected.device, trim_unused);
+          session->selected.device.is_cuda()
+              ? deltafin::provider_internal::cuda_provider_memory_snapshot(
+                    session->selected.device, trim_unused)
+              : deltafin::provider_internal::xpu_provider_memory_snapshot(
+                    session->selected.device, trim_unused);
       if (snapshot.active_valid) {
         produced.available_fields |=
             DELTAFIN_PROVIDER_MEMORY_ACTIVE_BYTES_V1;
@@ -4026,9 +4031,11 @@ extern "C" int32_t deltafin_provider_target_pilot_enable_v1(
     session->require_open();
     if (session->flags != 0 ||
         (session->selected.kind != DELTAFIN_PROVIDER_DEVICE_CPU_V1 &&
-         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_MPS_V1)) {
+         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_MPS_V1 &&
+         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_CUDA_V1 &&
+         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_XPU_V1)) {
       throw std::invalid_argument(
-          "target PILOT admission requires a real CPU or MPS session");
+          "target PILOT admission requires a real (non-synthetic) device session");
     }
     if (session->target_pilot_enabled || session->last_spine_generation != 0 ||
         session->resident_spine_prefix_layers != 0 ||

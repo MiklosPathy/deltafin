@@ -33,6 +33,18 @@ inline std::uint32_t cuda_device_count() {
 #endif
 }
 
+/// Intel XPU devices (Arc discrete or integrated), reached through the
+/// `at::kXPU` backend. Uses the ATen hooks so this header needs no SYCL
+/// include; the hooks are registered when `torch_xpu` is loaded.
+inline std::uint32_t xpu_device_count() {
+  if (!at::hasXPU()) {
+    return 0;
+  }
+  return static_cast<std::uint32_t>(std::min<std::size_t>(
+      static_cast<std::size_t>(at::detail::getXPUHooks().getNumGPUs()),
+      std::numeric_limits<std::uint32_t>::max()));
+}
+
 struct SelectedDevice {
   at::Device device;
   std::uint32_t kind;
@@ -47,6 +59,8 @@ inline SelectedDevice select_device(const std::uint32_t requested,
       kind = DELTAFIN_PROVIDER_DEVICE_MPS_V1;
     } else if (cuda_device_count() != 0) {
       kind = DELTAFIN_PROVIDER_DEVICE_CUDA_V1;
+    } else if (xpu_device_count() != 0) {
+      kind = DELTAFIN_PROVIDER_DEVICE_XPU_V1;
     } else {
       kind = DELTAFIN_PROVIDER_DEVICE_CPU_V1;
     }
@@ -81,6 +95,16 @@ inline SelectedDevice select_device(const std::uint32_t requested,
                          static_cast<c10::DeviceIndex>(requested_index)),
               kind, requested_index};
     }
+    case DELTAFIN_PROVIDER_DEVICE_XPU_V1: {
+      const std::uint32_t count = xpu_device_count();
+      if (requested_index >= count) {
+        throw std::runtime_error(
+            "XPU device index is outside the LibTorch provider inventory");
+      }
+      return {at::Device(at::kXPU,
+                         static_cast<c10::DeviceIndex>(requested_index)),
+              kind, requested_index};
+    }
     default:
       throw std::invalid_argument("unknown provider device kind");
   }
@@ -98,6 +122,11 @@ inline SelectedDevice select_device(const std::uint32_t requested,
 inline bool cuda_case_should_skip(const std::uint32_t requested) {
   return requested == DELTAFIN_PROVIDER_DEVICE_CUDA_V1 &&
          cuda_device_count() == 0;
+}
+
+inline bool xpu_case_should_skip(const std::uint32_t requested) {
+  return requested == DELTAFIN_PROVIDER_DEVICE_XPU_V1 &&
+         xpu_device_count() == 0;
 }
 
 }  // namespace deltafin::provider_internal

@@ -17,6 +17,9 @@
 #if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
 #include <ATen/cuda/CUDAContextLight.h>
 #endif
+#if defined(DELTAFIN_HAVE_XPU_PROVIDER_V1)
+#include <ATen/xpu/XPUContext.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -41,6 +44,15 @@ namespace {
 // tensor operation.
 decltype(&at::cuda::getCurrentDeviceProperties) k3_torch_cuda_anchor_abi =
     &at::cuda::getCurrentDeviceProperties;
+#endif
+
+#if defined(DELTAFIN_HAVE_XPU_PROVIDER_V1)
+// The XPU sibling of the anchor above: torch_xpu.dll holds the XPU ATen kernels
+// and registers them from its static initializers, but the provider otherwise
+// reaches XPU only through `c10::xpu` (c10_xpu). This external-linkage variable
+// keeps the `torch_xpu.dll` import so the kernels register.
+decltype(&at::xpu::getCurrentDeviceProperties) k3_torch_xpu_anchor_abi =
+    &at::xpu::getCurrentDeviceProperties;
 #endif
 
 static_assert(sizeof(DeltafinProviderInventoryV1) == 96,
@@ -268,6 +280,8 @@ extern "C" int32_t deltafin_provider_inventory_v1(
         deltafin::provider_internal::mps_available() ? 1u : 0u;
     inventory->cuda_device_count =
         deltafin::provider_internal::cuda_device_count();
+    inventory->xpu_device_count =
+        deltafin::provider_internal::xpu_device_count();
     inventory->provider_features = 0;
     if (deltafin::provider_internal::cuda_moe_compiled()) {
       inventory->provider_features |=
@@ -276,6 +290,13 @@ extern "C" int32_t deltafin_provider_inventory_v1(
     if (deltafin::provider_internal::cuda_spine_bf16_compiled()) {
       inventory->provider_features |=
           DELTAFIN_PROVIDER_FEATURE_CUDA_EXACT_BF16_V1;
+    }
+    if (deltafin::provider_internal::xpu_moe_compiled()) {
+      inventory->provider_features |= DELTAFIN_PROVIDER_FEATURE_XPU_MOE_V1;
+    }
+    if (deltafin::provider_internal::xpu_spine_bf16_compiled()) {
+      inventory->provider_features |=
+          DELTAFIN_PROVIDER_FEATURE_XPU_EXACT_BF16_V1;
     }
     copy_text(inventory->libtorch_version, sizeof(inventory->libtorch_version),
               TORCH_VERSION);

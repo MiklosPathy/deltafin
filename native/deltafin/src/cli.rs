@@ -34,7 +34,7 @@ Run options:\n\
   --router-trace PATH    Append native expert-route JSONL (relative to model root)\n\
   --router-trace-mode M  off, buffered, or sync (path alone implies buffered)\n\
   --model-root PATH      Deltafin install/model root (default: current directory)\n\
-  --device DEVICE        auto, cpu, mps, cuda, or cuda:N (K3_DEV fallback)\n\
+  --device DEVICE        auto, cpu, mps, cuda, cuda:N, xpu, or xpu:N (K3_DEV fallback)\n\
   --spine FORMAT         auto/int8 = quantized row-int8 default; bf16 = original weights, explicit\n\
   --spine-read-threads N Override bounded spine readers (1..=16; K3_SPINE_READ_THREADS fallback)\n\
   --expert-backend NAME  auto, cpu, metal, or cuda (K3_MOE fallback)\n\
@@ -53,7 +53,7 @@ Serve options:\n\
   --router-trace PATH    Append native expert-route JSONL (relative to model root)\n\
   --router-trace-mode M  off, buffered, or sync (path alone implies buffered)\n\
   --model-root PATH      Deltafin install/model root (default: current directory)\n\
-  --device DEVICE        auto, cpu, mps, cuda, or cuda:N (K3_DEV fallback)\n\
+  --device DEVICE        auto, cpu, mps, cuda, cuda:N, xpu, or xpu:N (K3_DEV fallback)\n\
   --spine FORMAT         auto/int8 = quantized row-int8 default; bf16 = original weights, explicit\n\
   --spine-read-threads N Override bounded spine readers (1..=16; K3_SPINE_READ_THREADS fallback)\n\
   --expert-backend NAME  auto, cpu, metal, or cuda (K3_MOE fallback)\n\

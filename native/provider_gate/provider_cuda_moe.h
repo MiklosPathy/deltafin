@@ -64,6 +64,17 @@ struct CudaProviderMemorySnapshot {
     const at::Device& device, bool trim_unused);
 
 /*
+ * The XPU sibling of the snapshot above, backed by the XPU caching allocator.
+ * A build without the XPU provider reports every field unknown.
+ */
+[[nodiscard]] CudaProviderMemorySnapshot xpu_provider_memory_snapshot(
+    const at::Device& device, bool trim_unused);
+
+/* Compile-time feature predicates, one pair per optional device kernel. */
+bool xpu_moe_compiled() noexcept;
+bool xpu_spine_bf16_compiled() noexcept;
+
+/*
  * Emitted only after a classified allocator failure and a successful stream
  * drain. Callers must still require an automatic backend request before using
  * the pinned plan for an exact CPU reconstruction.

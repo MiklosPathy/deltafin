@@ -149,6 +149,7 @@ pub enum DeviceRequest {
     Cpu,
     Mps,
     Cuda(u16),
+    Xpu(u16),
 }
 
 impl DeviceRequest {
@@ -162,16 +163,23 @@ impl DeviceRequest {
             "cpu" => Ok(Self::Cpu),
             "mps" => Ok(Self::Mps),
             "cuda" => Ok(Self::Cuda(0)),
+            "xpu" => Ok(Self::Xpu(0)),
             _ => {
-                let Some(index) = value.strip_prefix("cuda:") else {
-                    return Err(DeltafinError::new(
-                        "device must be auto, cpu, mps, cuda, or cuda:N",
-                    ));
-                };
-                let index = index.parse::<u16>().map_err(|_| {
-                    DeltafinError::new("CUDA device index must be a non-negative integer")
-                })?;
-                Ok(Self::Cuda(index))
+                if let Some(index) = value.strip_prefix("cuda:") {
+                    let index = index.parse::<u16>().map_err(|_| {
+                        DeltafinError::new("CUDA device index must be a non-negative integer")
+                    })?;
+                    return Ok(Self::Cuda(index));
+                }
+                if let Some(index) = value.strip_prefix("xpu:") {
+                    let index = index.parse::<u16>().map_err(|_| {
+                        DeltafinError::new("XPU device index must be a non-negative integer")
+                    })?;
+                    return Ok(Self::Xpu(index));
+                }
+                Err(DeltafinError::new(
+                    "device must be auto, cpu, mps, cuda, cuda:N, xpu, or xpu:N",
+                ))
             }
         }
     }
@@ -182,6 +190,7 @@ pub enum Device {
     Cpu,
     Mps,
     Cuda(u16),
+    Xpu(u16),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -221,6 +230,8 @@ impl Display for Device {
             Self::Mps => formatter.write_str("mps"),
             Self::Cuda(0) => formatter.write_str("cuda"),
             Self::Cuda(index) => write!(formatter, "cuda:{index}"),
+            Self::Xpu(0) => formatter.write_str("xpu"),
+            Self::Xpu(index) => write!(formatter, "xpu:{index}"),
         }
     }
 }
@@ -229,6 +240,7 @@ impl Display for Device {
 pub struct ProviderInventory {
     pub mps: bool,
     pub cuda_devices: u16,
+    pub xpu_devices: u16,
 }
 
 impl ProviderInventory {
@@ -236,6 +248,7 @@ impl ProviderInventory {
         match request {
             DeviceRequest::Auto if self.mps => Ok(Device::Mps),
             DeviceRequest::Auto if self.cuda_devices > 0 => Ok(Device::Cuda(0)),
+            DeviceRequest::Auto if self.xpu_devices > 0 => Ok(Device::Xpu(0)),
             DeviceRequest::Auto | DeviceRequest::Cpu => Ok(Device::Cpu),
             DeviceRequest::Mps if self.mps => Ok(Device::Mps),
             DeviceRequest::Mps => Err(DeltafinError::new(
@@ -245,6 +258,11 @@ impl ProviderInventory {
             DeviceRequest::Cuda(index) => Err(DeltafinError::new(format!(
                 "CUDA device {index} was requested, but only {} device(s) are available",
                 self.cuda_devices
+            ))),
+            DeviceRequest::Xpu(index) if index < self.xpu_devices => Ok(Device::Xpu(index)),
+            DeviceRequest::Xpu(index) => Err(DeltafinError::new(format!(
+                "XPU device {index} was requested, but only {} device(s) are available",
+                self.xpu_devices
             ))),
         }
     }
@@ -368,12 +386,14 @@ mod tests {
         let all = ProviderInventory {
             mps: true,
             cuda_devices: 2,
+            xpu_devices: 0,
         };
         assert_eq!(all.select(DeviceRequest::Auto).unwrap(), Device::Mps);
 
         let cuda_only = ProviderInventory {
             mps: false,
             cuda_devices: 2,
+            xpu_devices: 0,
         };
         assert_eq!(
             cuda_only.select(DeviceRequest::Auto).unwrap(),
@@ -392,6 +412,7 @@ mod tests {
         let apple = ProviderInventory {
             mps: true,
             cuda_devices: 0,
+            xpu_devices: 0,
         };
         let fallback = apple
             .select_target(DeviceRequest::Auto, true, Some(APPLE_M1_CPU_FAMILY))
@@ -446,6 +467,7 @@ mod tests {
         let cuda = ProviderInventory {
             mps: false,
             cuda_devices: 2,
+            xpu_devices: 0,
         };
         assert_eq!(
             cuda.select_target(DeviceRequest::Auto, true, Some(APPLE_M1_CPU_FAMILY))
@@ -456,6 +478,7 @@ mod tests {
         let mixed = ProviderInventory {
             mps: true,
             cuda_devices: 1,
+            xpu_devices: 0,
         };
         assert_eq!(
             mixed
@@ -482,6 +505,7 @@ mod tests {
                 ProviderInventory {
                     mps: true,
                     cuda_devices: 2,
+            xpu_devices: 0,
                 },
                 true,
                 Some(APPLE_M1_CPU_FAMILY),
@@ -492,6 +516,7 @@ mod tests {
                 ProviderInventory {
                     mps: true,
                     cuda_devices: 0,
+            xpu_devices: 0,
                 },
                 true,
                 Some(APPLE_M1_CPU_FAMILY),
@@ -502,6 +527,7 @@ mod tests {
                 ProviderInventory {
                     mps: true,
                     cuda_devices: 0,
+            xpu_devices: 0,
                 },
                 true,
                 Some(APPLE_M1_CPU_FAMILY + 1),
@@ -512,6 +538,7 @@ mod tests {
                 ProviderInventory {
                     mps: true,
                     cuda_devices: 0,
+            xpu_devices: 0,
                 },
                 false,
                 Some(APPLE_M1_CPU_FAMILY),
@@ -522,6 +549,7 @@ mod tests {
                 ProviderInventory {
                     mps: false,
                     cuda_devices: 2,
+            xpu_devices: 0,
                 },
                 true,
                 None,

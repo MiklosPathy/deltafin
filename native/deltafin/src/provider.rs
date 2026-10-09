@@ -29,13 +29,19 @@ const ABI_VERSION: u32 = 1;
 const DEVICE_CPU: u32 = 1;
 const DEVICE_MPS: u32 = 2;
 const DEVICE_CUDA: u32 = 3;
+const DEVICE_XPU: u32 = 4;
 const CHECK_RMS_FP32: u32 = 1 << 0;
 const CHECK_MATMUL_FP32: u32 = 1 << 1;
 const CHECK_SOFTMAX_FP32: u32 = 1 << 2;
 const CHECK_PACKED_INT8_FP32: u32 = 1 << 3;
 const FEATURE_CUDA_MOE: u32 = 1 << 0;
 const FEATURE_CUDA_EXACT_BF16: u32 = 1 << 1;
-const KNOWN_PROVIDER_FEATURES: u32 = FEATURE_CUDA_MOE | FEATURE_CUDA_EXACT_BF16;
+const FEATURE_XPU_MOE: u32 = 1 << 2;
+const FEATURE_XPU_EXACT_BF16: u32 = 1 << 3;
+const KNOWN_PROVIDER_FEATURES: u32 = FEATURE_CUDA_MOE
+    | FEATURE_CUDA_EXACT_BF16
+    | FEATURE_XPU_MOE
+    | FEATURE_XPU_EXACT_BF16;
 const REQUIRE_PACKED_INT8: u32 = 1 << 0;
 const SESSION_SYNTHETIC_SPLIT: u32 = 1 << 0;
 const SESSION_SYNTHETIC_KDA: u32 = 1 << 1;
@@ -141,7 +147,8 @@ struct InventoryV1 {
     mps_available: u32,
     cuda_device_count: u32,
     provider_features: u32,
-    reserved: [u32; 10],
+    xpu_device_count: u32,
+    reserved: [u32; 9],
     libtorch_version: [c_char; 32],
 }
 
@@ -154,7 +161,8 @@ impl InventoryV1 {
             mps_available: 0,
             cuda_device_count: 0,
             provider_features: 0,
-            reserved: [0; 10],
+            xpu_device_count: 0,
+            reserved: [0; 9],
             libtorch_version: [0; 32],
         }
     }
@@ -2292,6 +2300,8 @@ pub struct NativeProviderInventory {
     pub providers: ProviderInventory,
     pub cuda_moe_compiled: bool,
     pub cuda_exact_bf16_compiled: bool,
+    pub xpu_moe_compiled: bool,
+    pub xpu_exact_bf16_compiled: bool,
     pub libtorch_version: String,
 }
 
@@ -2338,7 +2348,7 @@ impl NativeProvider {
         if inventory.abi_version != ABI_VERSION
             || inventory.cpu_available != 1
             || inventory.provider_features & !KNOWN_PROVIDER_FEATURES != 0
-            || inventory.reserved != [0; 10]
+            || inventory.reserved != [0; 9]
         {
             return Err(DeltafinError::new(
                 "native provider returned an invalid ABI version or missing CPU provider",
@@ -2349,13 +2359,19 @@ impl NativeProvider {
                 "native provider reported more CUDA devices than Deltafin can address",
             )
         })?;
+        let xpu_devices = u16::try_from(inventory.xpu_device_count).map_err(|_| {
+            DeltafinError::new("native provider reported more XPU devices than Deltafin can address")
+        })?;
         Ok(NativeProviderInventory {
             providers: ProviderInventory {
                 mps: inventory.mps_available != 0,
                 cuda_devices,
+                xpu_devices,
             },
             cuda_moe_compiled: inventory.provider_features & FEATURE_CUDA_MOE != 0,
             cuda_exact_bf16_compiled: inventory.provider_features & FEATURE_CUDA_EXACT_BF16 != 0,
+            xpu_moe_compiled: inventory.provider_features & FEATURE_XPU_MOE != 0,
+            xpu_exact_bf16_compiled: inventory.provider_features & FEATURE_XPU_EXACT_BF16 != 0,
             libtorch_version: fixed_c_string(&inventory.libtorch_version),
         })
     }
@@ -2369,6 +2385,7 @@ impl NativeProvider {
             Device::Cpu => (DEVICE_CPU, 0),
             Device::Mps => (DEVICE_MPS, 0),
             Device::Cuda(index) => (DEVICE_CUDA, u32::from(index)),
+            Device::Xpu(index) => (DEVICE_XPU, u32::from(index)),
         };
         let request = CanaryRequestV1 {
             struct_size: size_of::<CanaryRequestV1>() as u32,
@@ -2405,6 +2422,9 @@ impl NativeProvider {
             (DEVICE_MPS, 0) => Device::Mps,
             (DEVICE_CUDA, index) => Device::Cuda(u16::try_from(index).map_err(|_| {
                 DeltafinError::new("native provider returned an invalid CUDA device index")
+            })?),
+            (DEVICE_XPU, index) => Device::Xpu(u16::try_from(index).map_err(|_| {
+                DeltafinError::new("native provider returned an invalid XPU device index")
             })?),
             _ => {
                 return Err(DeltafinError::new(
@@ -5271,6 +5291,7 @@ fn resolve_target_backend(
             Device::Mps => TargetExpertBackend::Metal,
             Device::Cpu => TargetExpertBackend::Cpu,
             Device::Cuda(_) => TargetExpertBackend::Auto,
+            Device::Xpu(_) => TargetExpertBackend::Cpu,
         }),
         TargetExpertBackend::Cpu => Ok(TargetExpertBackend::Cpu),
         TargetExpertBackend::Metal if device == Device::Mps => Ok(TargetExpertBackend::Metal),
@@ -8143,6 +8164,7 @@ fn device_fields(device: Device) -> (u32, u32) {
         Device::Cpu => (DEVICE_CPU, 0),
         Device::Mps => (DEVICE_MPS, 0),
         Device::Cuda(index) => (DEVICE_CUDA, u32::from(index)),
+        Device::Xpu(index) => (DEVICE_XPU, u32::from(index)),
     }
 }
 
@@ -8153,6 +8175,9 @@ fn decode_device(kind: u32, index: u32) -> Result<Device> {
         (DEVICE_CUDA, index) => u16::try_from(index)
             .map(Device::Cuda)
             .map_err(|_| DeltafinError::new("provider returned an invalid CUDA device index")),
+        (DEVICE_XPU, index) => u16::try_from(index)
+            .map(Device::Xpu)
+            .map_err(|_| DeltafinError::new("provider returned an invalid XPU device index")),
         _ => Err(DeltafinError::new(
             "provider returned an invalid selected device",
         )),

@@ -1109,12 +1109,18 @@ fn report_native_runtime(executable: &Path) -> Result<()> {
     println!("provider ABI: linked without Python");
     println!("LibTorch: {}", inventory.libtorch_version);
     println!(
-        "providers: cpu=available mps={} cuda_devices={} cuda_moe_compiled={} cuda_exact_bf16_compiled={}",
+        "providers: cpu=available mps={} cuda_devices={} cuda_moe_compiled={} cuda_exact_bf16_compiled={} xpu_devices={} xpu_moe_compiled={} xpu_exact_bf16_compiled={}",
         availability(inventory.providers.mps),
         inventory.providers.cuda_devices,
         yes_no(inventory.cuda_moe_compiled),
         yes_no(inventory.cuda_exact_bf16_compiled),
+        inventory.providers.xpu_devices,
+        yes_no(inventory.xpu_moe_compiled),
+        yes_no(inventory.xpu_exact_bf16_compiled),
     );
+    if option_env!("DELTAFIN_LIBTORCH_XPU").is_some() {
+        println!("LibTorch GPU runtime: Intel XPU (at::kXPU)");
+    }
     if let Some(cuda_major) = option_env!("DELTAFIN_LIBTORCH_CUDA_MAJOR") {
         println!("LibTorch CUDA runtime ABI: {cuda_major}.x");
     }
@@ -1199,6 +1205,14 @@ fn report_native_runtime(executable: &Path) -> Result<()> {
     }
     for index in 0..inventory.providers.cuda_devices {
         let device = crate::platform::Device::Cuda(index);
+        print_canary(NativeProvider::canary(device, (32, 32), false)?);
+        print_split_canary(NativeProvider::split_layer_canary(device)?);
+        print_spine_binding_canary(NativeProvider::spine_binding_canary(device)?);
+        print_kda_canary(NativeProvider::kda_transaction_canary(device)?);
+        print_mla_canary(NativeProvider::mla_transaction_canary(device)?);
+    }
+    for index in 0..inventory.providers.xpu_devices {
+        let device = crate::platform::Device::Xpu(index);
         print_canary(NativeProvider::canary(device, (32, 32), false)?);
         print_split_canary(NativeProvider::split_layer_canary(device)?);
         print_spine_binding_canary(NativeProvider::spine_binding_canary(device)?);

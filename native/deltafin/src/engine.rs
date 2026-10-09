@@ -1198,7 +1198,20 @@ fn select_target_for_spine(
                 // selecting CUDA and discovering the missing kernel at bind.
                 eligible.cuda_devices = 0;
             }
-            DeviceRequest::Cpu | DeviceRequest::Mps => {}
+            DeviceRequest::Cpu | DeviceRequest::Mps | DeviceRequest::Xpu(_) => {}
+        }
+    }
+    if original_bf16 && !inventory.xpu_exact_bf16_compiled {
+        match request {
+            DeviceRequest::Xpu(index) => {
+                return Err(DeltafinError::new(format!(
+                    "XPU device {index} was requested for original-BF16 K3, but this Deltafin binary was built without its exact RAW_BF16 XPU kernel; rebuild with the SYCL spine kernel, or explicitly use --spine int8"
+                )));
+            }
+            DeviceRequest::Auto => eligible.xpu_devices = 0,
+            DeviceRequest::Cpu
+            | DeviceRequest::Mps
+            | DeviceRequest::Cuda(_) => {}
         }
     }
     eligible.select_target(request, original_bf16, apple_family)
@@ -2773,6 +2786,9 @@ fn resolve_expert_backend(
             Device::Mps => Ok(ResolvedExpertBackend::Metal),
             Device::Cuda(_) if cuda_moe_compiled => Ok(ResolvedExpertBackend::CudaAuto),
             Device::Cuda(_) => Ok(ResolvedExpertBackend::Cpu),
+            // Phase 1: XPU has no expert kernel yet, so experts use the exact
+            // CPU MXFP4 path while attention runs on the device.
+            Device::Xpu(_) => Ok(ResolvedExpertBackend::Cpu),
         },
         ExpertBackendRequest::Cpu => Ok(ResolvedExpertBackend::Cpu),
         ExpertBackendRequest::Metal if device == Device::Mps && inventory.mps => {
@@ -7919,6 +7935,12 @@ fn provider_memory(snapshot: NativeProviderMemorySnapshot) -> ProviderMemory {
             // both values remains unknown and therefore fails closed.
             total_bytes: snapshot.total_bytes,
             available_bytes: snapshot.available_bytes,
+        },
+        // An Intel APU's XPU memory is shared system memory, so it is modelled
+        // as unified rather than discrete VRAM.
+        Device::Xpu(_) => ProviderMemory::Unified {
+            recommended_working_set_bytes: None,
+            available_working_set_bytes: snapshot.available_bytes,
         },
     }
 }
