@@ -74,6 +74,10 @@ struct CudaProviderMemorySnapshot {
 bool xpu_moe_compiled() noexcept;
 bool xpu_spine_bf16_compiled() noexcept;
 
+/* Runs the SYCL probe kernel and returns its checksum, or -1 when the XPU
+ * kernel DLL is not linked. */
+std::int32_t xpu_probe_checksum();
+
 /*
  * Emitted only after a classified allocator failure and a successful stream
  * drain. Callers must still require an automatic backend request before using

@@ -311,6 +311,24 @@ extern "C" int32_t deltafin_provider_inventory_v1(
   }
 }
 
+extern "C" int32_t deltafin_provider_xpu_probe_v1(
+    int32_t* checksum, char* error, const size_t error_capacity) {
+  try {
+    if (checksum == nullptr) {
+      throw std::invalid_argument("provider XPU probe checksum pointer is null");
+    }
+    *checksum = deltafin::provider_internal::xpu_probe_checksum();
+    copy_text(error, error_capacity, "");
+    return 0;
+  } catch (const std::exception& exception) {
+    copy_text(error, error_capacity, exception.what());
+    return 1;
+  } catch (...) {
+    copy_text(error, error_capacity, "unknown C++ provider XPU probe failure");
+    return 1;
+  }
+}
+
 extern "C" int32_t deltafin_provider_canary_v1(
     const DeltafinProviderCanaryRequestV1* request,
     DeltafinProviderCanaryReportV1* report, char* error,

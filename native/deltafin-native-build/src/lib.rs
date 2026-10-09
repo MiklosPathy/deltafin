@@ -610,6 +610,7 @@ struct ProviderBuildArtifacts {
     guard: PythonGuard,
     cuda_provider: Option<CudaProviderBuild>,
     cuda: Option<CudaBuild>,
+    xpu_kernels: Option<PathBuf>,
     gpu_runtime: Option<GpuRuntime>,
 }
 
@@ -714,6 +715,11 @@ pub fn run_production_build() {
         println!("cargo:rustc-link-lib=dylib=torch_xpu");
         println!("cargo:rustc-link-lib=dylib=c10_xpu");
         println!("cargo:rustc-env=DELTAFIN_LIBTORCH_XPU=1");
+    }
+    if artifacts.xpu_kernels.is_some() {
+        // The import library sits beside the DLL in the provider build dir,
+        // which is already on the native link search path.
+        println!("cargo:rustc-link-lib=dylib=deltafin_xpu_kernels");
     }
 
     if let Some(provider) = &artifacts.cuda_provider {
@@ -844,6 +850,9 @@ pub fn run_production_build() {
                 if directory.is_dir() {
                     sources.push(directory);
                 }
+            }
+            if artifacts.xpu_kernels.is_some() {
+                sources.push(artifacts.native_build.clone());
             }
         }
         sources.push(artifacts.torch_lib.clone());
@@ -1335,12 +1344,18 @@ fn build_provider_artifacts(
         gpu_runtime,
         emit_cargo_metadata,
     );
+    let xpu_kernels = (gpu_runtime == Some(GpuRuntime::Xpu)).then(|| {
+        build_xpu_kernels(repository, &native_build, &guard, emit_cargo_metadata)
+    }).flatten();
     let mut definitions = vec!["DELTAFIN_HAVE_MXFP4_CPU_V1=1"];
     if cuda_provider.is_some() {
         definitions.push("DELTAFIN_HAVE_CUDA_PROVIDER_V1=1");
     }
     if gpu_runtime == Some(GpuRuntime::Xpu) {
         definitions.push("DELTAFIN_HAVE_XPU_PROVIDER_V1=1");
+    }
+    if xpu_kernels.is_some() {
+        definitions.push("DELTAFIN_HAVE_XPU_MOE_V1=1");
     }
     if cuda.is_some() {
         definitions.extend([
@@ -1495,6 +1510,7 @@ fn build_provider_artifacts(
         guard,
         cuda_provider,
         cuda,
+        xpu_kernels,
         gpu_runtime,
     })
 }
@@ -3800,6 +3816,51 @@ fn build_cuda_kernel(
         object,
         spine_object,
     })
+}
+
+/// Compile the SYCL device kernels into a self-contained DLL. `clang++ -fsycl
+/// -shared` runs the whole device-image pipeline (bundle, SPIR-V, offload
+/// wrapper, link), so the resulting DLL registers its kernels on load and the
+/// provider only needs the import library. Returns the DLL path.
+fn build_xpu_kernels(
+    repository: &Path,
+    native_build: &Path,
+    guard: &PythonGuard,
+    emit_cargo_metadata: bool,
+) -> Option<PathBuf> {
+    let Some(root) = sycl_root() else {
+        if emit_cargo_metadata {
+            println!(
+                "cargo:warning=XPU LibTorch found without DELTAFIN_SYCL_ROOT; the SYCL expert kernels are not built and experts use the exact CPU MXFP4 fallback"
+            );
+        }
+        return None;
+    };
+    let clangxx = root
+        .join("bin")
+        .join(format!("clang++{}", std::env::consts::EXE_SUFFIX));
+    if !clangxx.is_file() {
+        panic!(
+            "DELTAFIN_SYCL_ROOT={} has no bin/clang++",
+            root.display()
+        );
+    }
+    let source = repository.join("tools/xpu_moe_kernels.cpp");
+    let dll = native_build.join("deltafin_xpu_kernels.dll");
+    let mut command = Command::new(&clangxx);
+    command
+        .args(["-fsycl", "-O3", "-DNDEBUG", "-std=c++20", "-shared"])
+        .arg("-I")
+        .arg(root.join("include"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&dll);
+    run_guarded_checked(&mut command, "compile XPU SYCL expert kernels", guard);
+    validate_object(&dll);
+    if emit_cargo_metadata {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    Some(dll)
 }
 
 fn plan_cuda_kernel_build(

@@ -1708,6 +1708,12 @@ int32_t deltafin_provider_inventory_v1(
     char* error,
     size_t error_capacity);
 
+/* Runs the XPU SYCL probe kernel; writes its checksum to `checksum`. */
+int32_t deltafin_provider_xpu_probe_v1(
+    int32_t* checksum,
+    char* error,
+    size_t error_capacity);
+
 int32_t deltafin_provider_canary_v1(
     const DeltafinProviderCanaryRequestV1* request,
     DeltafinProviderCanaryReportV1* report,

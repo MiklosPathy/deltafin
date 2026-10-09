@@ -1219,6 +1219,11 @@ fn report_native_runtime(executable: &Path) -> Result<()> {
         print_kda_canary(NativeProvider::kda_transaction_canary(device)?);
         print_mla_canary(NativeProvider::mla_transaction_canary(device)?);
     }
+    if inventory.providers.xpu_devices != 0 {
+        if let Some(checksum) = NativeProvider::xpu_probe()? {
+            println!("xpu SYCL kernel probe: PASS (checksum={checksum})");
+        }
+    }
     Ok(())
 }
 

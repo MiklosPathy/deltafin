@@ -1940,6 +1940,11 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
+    fn deltafin_provider_xpu_probe_v1(
+        checksum: *mut i32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
     fn deltafin_provider_canary_v1(
         request: *const CanaryRequestV1,
         report: *mut CanaryReportV1,
@@ -2374,6 +2379,21 @@ impl NativeProvider {
             xpu_exact_bf16_compiled: inventory.provider_features & FEATURE_XPU_EXACT_BF16 != 0,
             libtorch_version: fixed_c_string(&inventory.libtorch_version),
         })
+    }
+
+    /// Run the XPU SYCL probe kernel. `None` when no XPU kernel DLL is linked
+    /// (the stub returns -1).
+    pub fn xpu_probe() -> Result<Option<i32>> {
+        let mut checksum = -1i32;
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: checksum/error are writable for the synchronous call.
+        let status = unsafe {
+            deltafin_provider_xpu_probe_v1(&mut checksum, error.as_mut_ptr(), error.len())
+        };
+        if status != 0 {
+            return Err(ffi_error("native provider XPU probe", &error));
+        }
+        Ok((checksum >= 0).then_some(checksum))
     }
 
     pub fn canary(

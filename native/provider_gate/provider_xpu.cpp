@@ -1,6 +1,7 @@
 #include "provider_cuda_moe.h"
 #include "provider_device.h"
 
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -92,5 +93,16 @@ bool xpu_spine_bf16_compiled() noexcept {
   return false;
 #endif
 }
+
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+// The SYCL kernel DLL's probe entry point. Referencing it keeps the
+// `deltafin_xpu_kernels.dll` import so its device image registers on load.
+extern "C" std::int32_t k3_xpu_probe();
+decltype(&k3_xpu_probe) k3_xpu_probe_anchor = &k3_xpu_probe;
+
+std::int32_t xpu_probe_checksum() { return k3_xpu_probe(); }
+#else
+std::int32_t xpu_probe_checksum() { return -1; }
+#endif
 
 }  // namespace deltafin::provider_internal
