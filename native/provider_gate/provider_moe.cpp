@@ -50,6 +50,18 @@ int mxfp4_cpu_compatible(void);
 }
 #endif
 
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+// The XPU SYCL kernel DLL. The expert weights are uploaded into USM shared
+// buffers so the host fills them and the kernel reads the same pointer.
+extern "C" {
+void* k3_xpu_alloc_shared(std::size_t bytes);
+void k3_xpu_free_shared(void* pointer);
+int k3_xpu_mxfp4_gemv(const std::uint8_t* packed, const std::uint8_t* scales,
+                      const float* x, float* output, int rows, int cols,
+                      int batches);
+}
+#endif
+
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #if defined(DELTAFIN_HAVE_METAL_MOE_V1)
@@ -1033,6 +1045,130 @@ at::Tensor execute_cpu(const PreparedMoeT1& prepared,
 #endif
 }
 
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+namespace {
+// Grow-only USM shared scratch, reused across calls. On an integrated GPU the
+// host fills these and the SYCL kernel reads the same pointer (zero copy).
+void* shared_scratch(void** slot, std::size_t* capacity, std::size_t bytes) {
+  if (*capacity < bytes) {
+    if (*slot != nullptr) {
+      k3_xpu_free_shared(*slot);
+    }
+    *slot = k3_xpu_alloc_shared(bytes);
+    *capacity = bytes;
+  }
+  return *slot;
+}
+}  // namespace
+
+at::Tensor execute_xpu(const PreparedMoeT1& prepared,
+                       const std::array<const std::uint8_t*, kMoeRouteTopK>& blobs,
+                       const MoeRunOptions& options,
+                       const MoeGeometry& geometry) {
+  const ExpertOffsets offsets = expert_offsets(geometry);
+  const auto input_device = prepared.routed_input.device();
+  at::Tensor input = prepared.routed_input_cpu.defined()
+      ? prepared.routed_input_cpu
+      : prepared.routed_input.to(at::kCPU, at::kFloat).contiguous();
+  const std::int64_t hidden = static_cast<std::int64_t>(geometry.routed_hidden);
+  const std::int64_t inter = static_cast<std::int64_t>(geometry.intermediate);
+  const std::size_t span = geometry.expert_span_bytes();
+
+  static thread_local void* blob_slot = nullptr;
+  static thread_local std::size_t blob_cap = 0;
+  static thread_local void* input_slot = nullptr;
+  static thread_local std::size_t input_cap = 0;
+  static thread_local void* gate_slot = nullptr;
+  static thread_local std::size_t gate_cap = 0;
+  static thread_local void* act_slot = nullptr;
+  static thread_local std::size_t act_cap = 0;
+  static thread_local void* out_slot = nullptr;
+  static thread_local std::size_t out_cap = 0;
+
+  auto* blob_shared = static_cast<std::uint8_t*>(
+      shared_scratch(&blob_slot, &blob_cap, kMoeRouteTopK * span));
+  auto* input_shared = static_cast<float*>(shared_scratch(
+      &input_slot, &input_cap, static_cast<std::size_t>(hidden) * 4));
+  auto* gate_shared = static_cast<float*>(shared_scratch(
+      &gate_slot, &gate_cap,
+      2 * kMoeRouteTopK * static_cast<std::size_t>(inter) * 4));
+  auto* act_shared = static_cast<float*>(shared_scratch(
+      &act_slot, &act_cap, kMoeRouteTopK * static_cast<std::size_t>(inter) * 4));
+  auto* out_shared = static_cast<float*>(shared_scratch(
+      &out_slot, &out_cap, kMoeRouteTopK * static_cast<std::size_t>(hidden) * 4));
+
+  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+    std::memcpy(blob_shared + edge * span, blobs[edge], span);
+  }
+  std::memcpy(input_shared, input.const_data_ptr<float>(),
+              static_cast<std::size_t>(hidden) * 4);
+
+  record_trace(options.execution_trace, MoeExecutionStage::XpuExpertDispatch);
+  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+    const std::uint8_t* blob = blob_shared + edge * span;
+    if (k3_xpu_mxfp4_gemv(blob + offsets.w1_packed, blob + offsets.w1_scales,
+                          input_shared, gate_shared + (2 * edge) * inter,
+                          static_cast<int>(inter), static_cast<int>(hidden),
+                          1) != 0) {
+      throw std::runtime_error("XPU MXFP4 w1 GEMV failed");
+    }
+    if (k3_xpu_mxfp4_gemv(blob + offsets.w3_packed, blob + offsets.w3_scales,
+                          input_shared, gate_shared + (2 * edge + 1) * inter,
+                          static_cast<int>(inter), static_cast<int>(hidden),
+                          1) != 0) {
+      throw std::runtime_error("XPU MXFP4 w3 GEMV failed");
+    }
+  }
+
+  at::Tensor gate_up = at::empty(
+      {static_cast<std::int64_t>(kMoeRouteTopK), 2, inter},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  std::memcpy(gate_up.data_ptr<float>(), gate_shared,
+              2 * kMoeRouteTopK * static_cast<std::size_t>(inter) * 4);
+  at::Tensor activated =
+      situ(gate_up.select(1, 0), gate_up.select(1, 1)).contiguous();
+  std::memcpy(act_shared, activated.const_data_ptr<float>(),
+              kMoeRouteTopK * static_cast<std::size_t>(inter) * 4);
+
+  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+    const std::uint8_t* blob = blob_shared + edge * span;
+    if (k3_xpu_mxfp4_gemv(blob + offsets.w2_packed, blob + offsets.w2_scales,
+                          act_shared + edge * inter, out_shared + edge * hidden,
+                          static_cast<int>(hidden), static_cast<int>(inter),
+                          1) != 0) {
+      throw std::runtime_error("XPU MXFP4 w2 GEMV failed");
+    }
+  }
+
+  at::Tensor outputs = at::empty(
+      {static_cast<std::int64_t>(kMoeRouteTopK), hidden},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  std::memcpy(outputs.data_ptr<float>(), out_shared,
+              kMoeRouteTopK * static_cast<std::size_t>(hidden) * 4);
+
+  const auto weights = route_weights(prepared.route);
+  at::Tensor combined = at::zeros(
+      {1, hidden}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+    outputs[static_cast<std::int64_t>(edge)].mul_(weights[edge]);
+    combined[0].add_(outputs[static_cast<std::int64_t>(edge)]);
+  }
+  return combined.to(input_device, at::kFloat);
+}
+#else
+at::Tensor execute_xpu(const PreparedMoeT1& prepared,
+                       const std::array<const std::uint8_t*, kMoeRouteTopK>& blobs,
+                       const MoeRunOptions& options,
+                       const MoeGeometry& geometry) {
+  static_cast<void>(prepared);
+  static_cast<void>(blobs);
+  static_cast<void>(options);
+  static_cast<void>(geometry);
+  throw std::runtime_error(
+      "XPU MXFP4 MoE kernel was not linked into this provider build");
+}
+#endif
+
 at::Tensor execute_metal(const PreparedMoeT1& prepared,
                          const std::array<const std::uint8_t*, kMoeRouteTopK>& blobs,
                          const MoeExpertLayout layout,
@@ -1626,6 +1762,18 @@ at::Tensor execute_metal_positions(
 MoeExpertBackend select_backend(const at::Device& device,
                                 const MoeExpertBackend requested,
                                 CudaMoeExpertCache* const cuda_cache) {
+#if !defined(DELTAFIN_HAVE_XPU_MOE_V1)
+#pragma message("PROVIDER_MOE: XPU MOE NOT DEFINED")
+#else
+#pragma message("PROVIDER_MOE: XPU MOE DEFINED")
+#endif
+  // The engine resolves an XPU device to the CPU backend (no device expert
+  // cache), but the SYCL MXFP4 kernel is the real XPU expert path.
+  if (requested == MoeExpertBackend::CpuMxfp4 && device.is_xpu()) {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+    return MoeExpertBackend::XpuMxfp4;
+#endif
+  }
   if (requested != MoeExpertBackend::Auto) {
     return requested;
   }
@@ -1646,6 +1794,13 @@ MoeExpertBackend select_backend(const at::Device& device,
   }
   if (device.is_cpu()) {
     return MoeExpertBackend::CpuMxfp4;
+  }
+  if (device.is_xpu()) {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+    return MoeExpertBackend::XpuMxfp4;
+#else
+    return MoeExpertBackend::CpuMxfp4;
+#endif
   }
   throw std::runtime_error("selected provider has no routed-MoE backend");
 }
@@ -2081,6 +2236,8 @@ at::Tensor execute_routed_moe_t1(const PreparedMoeT1& prepared,
       record_trace(options.execution_trace,
                    MoeExecutionStage::CudaExpertDispatch);
       return options.cuda_cache->execute_t1(prepared, experts);
+    case MoeExpertBackend::XpuMxfp4:
+      return execute_xpu(prepared, blobs, options, geometry);
     case MoeExpertBackend::Auto:
       break;
   }
@@ -2215,6 +2372,8 @@ at::Tensor execute_routed_moe_positions_t1(
       record_trace(options.execution_trace,
                    MoeExecutionStage::CudaExpertDispatch);
       return options.cuda_cache->execute_positions_t1(prepared_rows, experts);
+    case MoeExpertBackend::XpuMxfp4:
+      return execute_cpu_positions(prepared_rows, experts, options, geometry);
     case MoeExpertBackend::Auto:
       break;
   }
@@ -2401,6 +2560,9 @@ at::Tensor run_moe_t1(const at::Tensor& hidden, const MoeSpineT1& spine,
       record_trace(options.execution_trace,
                    MoeExecutionStage::CudaExpertDispatch);
       routed = options.cuda_cache->execute_t1(prepared, experts);
+      break;
+    case MoeExpertBackend::XpuMxfp4:
+      routed = execute_xpu(prepared, blobs, options, geometry);
       break;
     case MoeExpertBackend::Auto:
       throw std::logic_error("automatic routed-MoE backend remained unresolved");

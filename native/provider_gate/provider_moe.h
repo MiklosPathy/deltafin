@@ -184,6 +184,7 @@ enum class MoeExpertBackend : std::uint32_t {
   CpuMxfp4 = 1,
   MetalMxfp4 = 2,
   CudaMxfp4 = 3,
+  XpuMxfp4 = 4,
 };
 
 // Optional focused-test probe. A null pointer is the production default, so
@@ -198,6 +199,7 @@ enum class MoeExecutionStage : std::uint8_t {
   MetalExpertRowDispatch,
   MetalExpertPositionDispatch,
   CudaExpertDispatch,
+  XpuExpertDispatch,
   RoutedUp,
   Shared,
   Merge,

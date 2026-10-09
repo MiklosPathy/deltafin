@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <mutex>
 
 #if defined(_WIN32)
 #define K3_XPU_EXPORT __declspec(dllexport)
@@ -31,10 +32,16 @@ constexpr int kIntermediate = 3072;
 constexpr std::int64_t kExpertSpan = 17'547'264;
 
 // One process-wide in-order queue. Kernel calls are synchronous (they wait), so
-// the provider sees the same ordering contract it expects from a stream.
+// the provider sees the same ordering contract it expects from a stream. A
+// mutex serializes submission, since the provider may call from several threads.
 sycl::queue& device_queue() {
   static sycl::queue queue{sycl::property::queue::in_order()};
   return queue;
+}
+
+std::mutex& queue_mutex() {
+  static std::mutex mutex;
+  return mutex;
 }
 
 inline float e2m1_value(std::uint8_t code) {
@@ -80,6 +87,7 @@ K3_XPU_EXPORT void k3_xpu_moe_shapes(int* hidden, int* intermediate, std::int64_
 }  // extern "C"
 
 K3_XPU_EXPORT std::int32_t k3_xpu_probe() {
+  std::lock_guard<std::mutex> lock(queue_mutex());
   auto& queue = device_queue();
   constexpr int kCount = 1024;
   std::int32_t* buffer = sycl::malloc_shared<std::int32_t>(kCount, queue);
@@ -96,11 +104,13 @@ K3_XPU_EXPORT std::int32_t k3_xpu_probe() {
 }
 
 K3_XPU_EXPORT void* k3_xpu_alloc_shared(std::size_t bytes) {
+  std::lock_guard<std::mutex> lock(queue_mutex());
   return sycl::malloc_shared(bytes, device_queue());
 }
 
 K3_XPU_EXPORT void k3_xpu_free_shared(void* pointer) {
   if (pointer != nullptr) {
+    std::lock_guard<std::mutex> lock(queue_mutex());
     sycl::free(pointer, device_queue());
   }
 }
@@ -121,6 +131,7 @@ K3_XPU_EXPORT int k3_xpu_mxfp4_gemv(
   const int groups = cols / 32;
   const std::int64_t total =
       static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(batches);
+  std::lock_guard<std::mutex> lock(queue_mutex());
   auto& queue = device_queue();
   queue
       .parallel_for(
