@@ -276,18 +276,26 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
     (anchor) so the linker keeps the `torch_xpu.dll` import and the XPU ATen
     kernels register.
 
-    - [ ] 1. **Device plumbing + ATen-XPU attention.** Rust `Device::Xpu` +
+    - [x] 1. **Device plumbing + ATen-XPU attention.** Rust `Device::Xpu` +
       `xpu`/`xpu:N` config, ABI `DELTAFIN_PROVIDER_DEVICE_XPU_V1`,
       `provider_device.h` XPU branch, memory snapshot via
       `c10::xpu::XPUCachingAllocator`, build-graph XPU flavor (link
       `torch_xpu`/`c10_xpu`, deploy the SYCL/oneMKL/UR runtime DLLs, anchor
       torch_xpu). Attention/dense/target run on XPU through ATen; experts use the
       exact CPU MXFP4 fallback. This is the first measurable number.
-    - [ ] 2. **XPU MXFP4 expert kernel + resident expert cache (SYCL).** Port the
-      MoE GEMV/MoE kernels to SYCL, add an `XpuMxfp4` `MoeExpertBackend`, and a
-      provider-owned device expert cache so resident experts never cross the bus.
+    - [~] 2. **XPU MXFP4 expert kernel + resident expert cache (SYCL).** Done:
+      SYCL kernel on USM shared weights (zero copy), `XpuMxfp4` backend wired,
+      prefill and decode both on XPU, crash fixed. Remaining: the kernel is
+      compute-bound (~2.1 GB/s, ~20 s/token) and the batched form is
+      TDR-unstable; a resident device expert cache is still to do.
     - [ ] 3. **XPU BF16 spine kernel (SYCL).** Port the RAW_BF16 projection kernel
       so original-BF16 K3 runs on XPU without expanding weights to FP32.
+
+    Status/handoff detail, environment and the stashed unstable WIP are in
+    `docs/XPU-PROVIDER-STATUS.md`. Attention (ATen XPU GEMV/int8-mm) is the
+    larger cost and is not covered by the three phases; it likely needs SYCL
+    kernels too. The dev box memory is ~30 GB/s, so even ideal kernels are
+    bandwidth-capped around ~0.3 tok/s.
 
     Builds on 29a's provider patterns; the XPU flavor is a sibling of the CUDA
     one, not a re-port of the CPU provider.
