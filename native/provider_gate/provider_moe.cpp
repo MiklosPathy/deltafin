@@ -25,8 +25,10 @@
 #include <c10/core/InferenceMode.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -1339,6 +1341,29 @@ at::Tensor execute_cpu_positions(
                                        pointers, options, geometry);
 }
 
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+at::Tensor execute_xpu_positions(
+    const std::span<const PreparedMoeT1* const> prepared_rows,
+    const CanonicalExpertPositionTileT1& experts,
+    const MoeRunOptions& options, const MoeGeometry& geometry) {
+  std::vector<const std::uint8_t*> pointers;
+  if (!experts.expert_span_pointers.empty()) {
+    pointers.assign(experts.expert_span_pointers.begin(),
+                    experts.expert_span_pointers.end());
+  } else {
+    pointers = contiguous_expert_span_pointers(experts);
+  }
+  std::vector<at::Tensor> outputs;
+  outputs.reserve(prepared_rows.size());
+  for (const PreparedMoeT1* prepared : prepared_rows) {
+    const auto blobs = ordered_expert_pointers(
+        prepared->route, experts.expert_ids, pointers, geometry);
+    outputs.push_back(execute_xpu(*prepared, blobs, options, geometry));
+  }
+  return at::cat(outputs, 0).contiguous();
+}
+#endif
+
 at::Tensor execute_cuda_plan_cpu_fallback(
     const std::span<const PreparedMoeT1* const> prepared_rows,
     const CanonicalExpertPositionTileT1& missing_experts,
@@ -1762,11 +1787,6 @@ at::Tensor execute_metal_positions(
 MoeExpertBackend select_backend(const at::Device& device,
                                 const MoeExpertBackend requested,
                                 CudaMoeExpertCache* const cuda_cache) {
-#if !defined(DELTAFIN_HAVE_XPU_MOE_V1)
-#pragma message("PROVIDER_MOE: XPU MOE NOT DEFINED")
-#else
-#pragma message("PROVIDER_MOE: XPU MOE DEFINED")
-#endif
   // The engine resolves an XPU device to the CPU backend (no device expert
   // cache), but the SYCL MXFP4 kernel is the real XPU expert path.
   if (requested == MoeExpertBackend::CpuMxfp4 && device.is_xpu()) {
@@ -2373,7 +2393,7 @@ at::Tensor execute_routed_moe_positions_t1(
                    MoeExecutionStage::CudaExpertDispatch);
       return options.cuda_cache->execute_positions_t1(prepared_rows, experts);
     case MoeExpertBackend::XpuMxfp4:
-      return execute_cpu_positions(prepared_rows, experts, options, geometry);
+      return execute_xpu_positions(prepared_rows, experts, options, geometry);
     case MoeExpertBackend::Auto:
       break;
   }
