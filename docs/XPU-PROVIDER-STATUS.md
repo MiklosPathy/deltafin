@@ -111,8 +111,23 @@ gone (measured 2.2 s/token).
    rows-per-work-item variant that reuses the shared activation across rows,
    and vectorised nibble decode, are the candidates. Under sustained load the
    iGPU also throttles the kernel ~2× versus a burst harness.
-3. Phase 3: SYCL RAW_BF16 spine kernel so `--spine bf16` runs on XPU.
-4. Evidence: a native test spec for XPU, and a `PLATFORMS.md` update.
+
+Phase 3 (BF16 spine) and the XPU native test spec are done; see below.
+
+## Done 2026-10-10: BF16 spine + evidence
+
+- **Phase 3 BF16 spine.** `k3_xpu_bf16_gemv` decodes the raw BF16 bits in place
+  (`bits << 16`) and backs a new `XpuExactBf16Backend`; the exact-BF16 projector
+  and spine uploader admit XPU with CUDA's signed-16-bit opaque storage. Verified
+  on the dev box: `representation=original-bf16`, resident 93/93 (101 GiB), the
+  correct completion, and no FP32 weight expansion.
+- **Native XPU test spec.** `deltafin-xtask native-test xpu` builds
+  `provider_xpu_test.cpp`, compares `xpu_int8_linear` against ATen's
+  `_weight_int8pack_mm` on the real device (`max_abs ~1.4e-4`), and skips with
+  the PASS marker on a CPU-only host. The test harness now links
+  `torch_xpu`/`c10_xpu` and the SYCL kernel import library, reaches the SYCL and
+  Intel XPU runtime on `PATH`, and audits the kernel DLL closure.
+- **PLATFORMS.md** records the XPU row and its bandwidth-bound caveat.
 
 ## Environment (Windows, not admin)
 
