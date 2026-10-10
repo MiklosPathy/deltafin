@@ -285,9 +285,21 @@ Guiding rule: maximize decode tok/s; the only hard boundary is K3 output accurac
       exact CPU MXFP4 fallback. This is the first measurable number.
     - [~] 2. **XPU MXFP4 expert kernel + resident expert cache (SYCL).** Done:
       SYCL kernel on USM shared weights (zero copy), `XpuMxfp4` backend wired,
-      prefill and decode both on XPU, crash fixed. Remaining: the kernel is
-      compute-bound (~2.1 GB/s, ~20 s/token) and the batched form is
-      TDR-unstable; a resident device expert cache is still to do.
+      prefill and decode both on XPU, crash fixed. Speed pass 2026-10-10
+      (uncommitted): the batched kernel now uses a work-group per output row
+      (4.4x, 57 -> 13 ms/dispatch in the burst harness) and a new SYCL int8
+      GEMV replaces ATen's `_weight_int8pack_mm` (whose ~6 ms fixed per-op
+      overhead dominated attention) across every resident projection. Zero-copy
+      2026-10-10: the reader's arena slabs are allocated as USM shared on XPU,
+      so the storage layer reads disk straight into device-visible memory and
+      the expert kernel reads it in place (removes the 280 MB/layer memcpy); the
+      host pin tier is disabled on XPU because every expert source must be USM.
+      XPU steady decode improved ~25 -> ~12.5 s/token with output parity.
+      Remaining: the gap to CPU (~9 s/token) is per-phase throughput, not
+      overlap (both paths are phase-serial, and the disk is already hidden by
+      prefetch); attention ~5.4 vs 2.9 and expert kernel ~3.85 vs 2.8, both
+      memory-streaming-bound at ~13 GB/s against a ~33 GB/s ceiling. A resident
+      device expert cache is still to do.
     - [ ] 3. **XPU BF16 spine kernel (SYCL).** Port the RAW_BF16 projection kernel
       so original-BF16 K3 runs on XPU without expanding weights to FP32.
 

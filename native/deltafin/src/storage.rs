@@ -1839,12 +1839,26 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> DeltafinError {
 struct AlignedBuffer {
     pointer: NonNull<u8>,
     capacity: usize,
-    layout: Layout,
+    allocated_len: usize,
+    /// Present only for Rust-allocator slabs. A provider (USM) slab instead
+    /// carries the release hook that owns it.
+    layout: Option<Layout>,
+    unified: Option<UnifiedBufferHooks>,
 }
 
 impl AlignedBuffer {
-    fn new(capacity: usize) -> Result<Self> {
+    fn new(capacity: usize, unified: Option<&UnifiedBufferHooks>) -> Result<Self> {
         let allocated_len = aligned_allocation_len(capacity)?;
+        if let Some(hooks) = unified {
+            let pointer = (hooks.allocate)(allocated_len, BUFFER_ALIGNMENT)?;
+            return Ok(Self {
+                pointer,
+                capacity,
+                allocated_len,
+                layout: None,
+                unified: Some(hooks.clone()),
+            });
+        }
         let layout = Layout::from_size_align(allocated_len, BUFFER_ALIGNMENT)
             .map_err(|_| DeltafinError::new("invalid aligned-buffer layout"))?;
         // SAFETY: `layout` is non-zero and valid. Ownership is retained by
@@ -1855,7 +1869,9 @@ impl AlignedBuffer {
         Ok(Self {
             pointer,
             capacity,
-            layout,
+            allocated_len,
+            layout: Some(layout),
+            unified: None,
         })
     }
 
@@ -1867,7 +1883,7 @@ impl AlignedBuffer {
     }
 
     const fn allocation_len(&self) -> usize {
-        self.layout.size()
+        self.allocated_len
     }
 
     fn pointer_at(&self, offset: usize, length: usize) -> *mut u8 {
@@ -1905,9 +1921,17 @@ unsafe impl Sync for AlignedBuffer {}
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
+        if let Some(hooks) = self.unified.as_ref() {
+            // Best-effort: a drop path can only leak a bounded provider slab.
+            let _ = (hooks.release)(self.pointer);
+            return;
+        }
         // SAFETY: `pointer` came from `alloc_zeroed(self.layout)` and has not
         // been deallocated or transferred.
-        unsafe { dealloc(self.pointer.as_ptr(), self.layout) }
+        let layout = self
+            .layout
+            .expect("Rust-allocated slab must retain its layout");
+        unsafe { dealloc(self.pointer.as_ptr(), layout) }
     }
 }
 
@@ -1916,13 +1940,16 @@ struct SharedBuffers {
 }
 
 impl SharedBuffers {
-    fn new(capacities: BufferLengths) -> Result<Self> {
+    fn new(
+        capacities: BufferLengths,
+        unified: Option<&UnifiedBufferHooks>,
+    ) -> Result<Self> {
         let capacities = capacities.as_array();
         Ok(Self {
             values: [
-                AlignedBuffer::new(capacities[0])?,
-                AlignedBuffer::new(capacities[1])?,
-                AlignedBuffer::new(capacities[2])?,
+                AlignedBuffer::new(capacities[0], unified)?,
+                AlignedBuffer::new(capacities[1], unified)?,
+                AlignedBuffer::new(capacities[2], unified)?,
             ],
         })
     }
@@ -1949,10 +1976,22 @@ fn invoke_buffer_retire_hook(hook: &BufferRetireHook) -> Result<()> {
     }
 }
 
+/// Device-visible arena allocation. When present, every slab is allocated
+/// through the provider (USM shared on XPU) rather than the Rust allocator, so
+/// a disk read and a device kernel share one pointer and the per-layer
+/// host->device copy disappears. The hooks are `None` on every other device,
+/// leaving the ordinary `alloc_zeroed`/`dealloc` path byte-for-byte unchanged.
+#[derive(Clone)]
+pub(crate) struct UnifiedBufferHooks {
+    pub allocate: Arc<dyn Fn(usize, usize) -> Result<NonNull<u8>> + Send + Sync>,
+    pub release: Arc<dyn Fn(NonNull<u8>) -> Result<()> + Send + Sync>,
+}
+
 struct BufferArena {
     inner: Mutex<Vec<ArenaSlot>>,
     available: Condvar,
     retire_hook: Option<BufferRetireHook>,
+    unified: Option<UnifiedBufferHooks>,
 }
 
 impl BufferArena {
@@ -1963,6 +2002,14 @@ impl BufferArena {
     fn new_with_retire_hook(
         slots: usize,
         retire_hook: Option<BufferRetireHook>,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_hooks(slots, retire_hook, None)
+    }
+
+    fn new_with_hooks(
+        slots: usize,
+        retire_hook: Option<BufferRetireHook>,
+        unified: Option<UnifiedBufferHooks>,
     ) -> Result<Arc<Self>> {
         if slots == 0 {
             return Err(DeltafinError::new(
@@ -1981,6 +2028,7 @@ impl BufferArena {
             ),
             available: Condvar::new(),
             retire_hook,
+            unified,
         }))
     }
 
@@ -2064,7 +2112,7 @@ impl BufferArena {
         // Arc can be released. Stable, fitting slabs never invoke the hook.
         drop(retired_buffers);
         let replacement = if needs_allocation {
-            match SharedBuffers::new(target_capacities) {
+            match SharedBuffers::new(target_capacities, self.unified.as_ref()) {
                 Ok(buffers) => Some((Arc::new(buffers), target_capacities)),
                 Err(error) => {
                     self.release(slot_index);
@@ -2239,7 +2287,7 @@ impl BufferArena {
             return Err(error);
         }
         drop(old_buffers);
-        let replacement = match SharedBuffers::new(target) {
+        let replacement = match SharedBuffers::new(target, self.unified.as_ref()) {
             Ok(buffers) => Arc::new(buffers),
             Err(error) => {
                 let mut slots = self.inner.lock().unwrap();
@@ -3455,6 +3503,15 @@ impl Reader {
         arena_slots: usize,
         retire_hook: Option<BufferRetireHook>,
     ) -> Result<Self> {
+        Self::with_arena_capacity_and_hooks(workers, arena_slots, retire_hook, None)
+    }
+
+    pub(crate) fn with_arena_capacity_and_hooks(
+        workers: usize,
+        arena_slots: usize,
+        retire_hook: Option<BufferRetireHook>,
+        unified: Option<UnifiedBufferHooks>,
+    ) -> Result<Self> {
         if workers == 0 {
             return Err(DeltafinError::new(
                 "storage reader needs at least one worker",
@@ -3468,7 +3525,7 @@ impl Reader {
             }),
             available: Condvar::new(),
         });
-        let arena = BufferArena::new_with_retire_hook(arena_slots, retire_hook)?;
+        let arena = BufferArena::new_with_hooks(arena_slots, retire_hook, unified)?;
         let mut threads: Vec<JoinHandle<()>> = Vec::with_capacity(workers);
         for index in 0..workers {
             let worker_state = Arc::clone(&state);

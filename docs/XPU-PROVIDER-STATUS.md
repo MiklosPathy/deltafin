@@ -6,7 +6,7 @@ shared system memory instead of streaming over PCIe from a 16 GB discrete GPU.
 
 ## Where it stands
 
-Working and committed (HEAD = `e38c0d0`):
+Committed (HEAD = `e38c0d0`):
 
 - `4b619cf` Phase 1 — XPU device plumbing + ATen-XPU attention. `doctor`
   reports `xpu_devices=1`, every XPU canary PASS, and `run --device xpu`
@@ -24,26 +24,92 @@ Working and committed (HEAD = `e38c0d0`):
   assumed contiguous, so pointers became bare `slot*span` and the null slot
   crashed. Prefill now also goes through the XPU backend.
 
+Uncommitted working-tree changes (2026-10-10) — the speed pass:
+
+- `tools/xpu_moe_kernels.cpp`: the batched MXFP4 expert kernel now runs **one
+  work-group per output row** (32 work-items, each striding the 32-wide scale
+  groups), takes the group scale with a single `ldexp` per 32 weights, and
+  decodes e2m1 from a table. The stashed serial-per-row loop called `ldexp` per
+  element. Standalone: **57 → 13 ms/dispatch (4.4×)**, max rel error 1.3e-4 vs a
+  scalar reference.
+- New `k3_xpu_int8_gemv`: row-quantized int8 GEMV that runs on **torch_xpu's own
+  stream** (the `sycl::queue*` is passed in, so it is ordered with the ATen ops
+  around it) and does **not** wait on the host — the in-order stream keeps it
+  ordered and the GPU pipelines. ATen's `_weight_int8pack_mm` has a **~6 ms
+  fixed per-op overhead** on the iGPU regardless of shape; the SYCL kernel is
+  **0.5 ms for 1024×7168 (12×)** and reads the torch_xpu USM allocations in
+  place, with no copy.
+- Wired into every resident int8 projection via `xpu_int8_linear` in
+  `provider_xpu.cpp`: `provider_mla.cpp`, `provider_kda.cpp`,
+  `provider_kda_batch.cpp`, `provider_target.cpp`, `provider_moe.cpp`. The ATen
+  op stays the fallback off XPU or for non-contiguous tensors.
+- Zero-copy expert arena (see the dedicated section below): the reader fills a
+  USM shared slab straight from disk and the expert kernel reads it in place,
+  removing the 280 MB/layer host→USM memcpy.
+
 ## Measured (dev box: Intel Graphics DEV_7D67, ~30 GB/s host memory)
 
-- ATen XPU ops are slow: `_weight_int8pack_mm` 12.5 ms, fp32 GEMV 14.6 ms for
-  1x7168x7168. Attention is ~18–20 s/token.
-- The SYCL MXFP4 kernel is compute-bound (e2m1 `switch` + `ldexp` in the inner
-  loop): ~2.1 GB/s, ~20 s/token for the experts.
-- End to end ~35–54 s/token. Not yet faster than the CUDA build; both
-  attention and the expert kernel need work.
+Decode steady state, `run --device xpu --stats`, Qwen + int8 spine, France
+prompt, 93 layers:
 
-## Instability (why we paused)
+- Before the speed pass: first token ~497 s, steady ~25 s/token
+  (attention ~16.5, expert_kernel ~6.1, expert_read ~3.2).
+- After the int8 pass: first token ~100 s, steady ~14.3 s/token
+  (attention ~4.8, expert_kernel ~6.1, expert_read ~3.2).
+- After the zero-copy pass: first token ~82 s, steady **~12.5 s/token**
+  (attention ~5.4, expert_read ~3.2, expert_kernel ~3.85).
+- After the async-int8 pass: first token ~84 s, steady **~11.5 s/token**
+  (attention ~7.0, expert_read ~2.0, expert_kernel ~2.35). Submitting the int8
+  projections on torch_xpu's in-order stream without a host wait lets the
+  torch-stream attention overlap the internal expert-kernel queue; the phase
+  split shifts but the wall drops ~1 s.
+- Output parity with CPU: `" Paris. The E"` → `" Paris. The Eiffel Tower"`.
 
-The uncommitted batched-kernel work caused `UR_RESULT_ERROR_DEVICE_LOST` and a
-GPU TDR (screen blank + driver restart). Stashed as:
+CPU baseline on the same box and request: first token ~63 s, steady
+**~9 s/token** (attention ~2.9, expert_read ~3.1, expert_kernel ~2.8).
 
-    git stash list   ->  stash@{0}: XPU batched kernel WIP (TDR-unstable)
+Both paths are phase-serial: CPU phases sum to 8.8 s and wall is 8.8 s; XPU
+phases sum to 12.45 s and wall is 12.5 s. **There is no separate "overlap" lever
+left:** the disk already overlaps compute — 64.7 GB/token of reads at 2.16 GB/s
+is ~30 s of I/O inside a 12.5 s/token wall, hidden by the prefetch reader. The
+remaining gap is pure per-phase throughput: attention (5.4 vs 2.9) and the
+expert kernel (3.85 vs 2.8), both memory-streaming-bound at ~13 GB/s against a
+~33 GB/s copy ceiling.
 
-The WIP batches the expert GEMVs into one launch (pointer arrays in USM shared,
-one work-item per output) and adds an e2m1 lookup table to drop `ldexp` from the
-inner loop — but it was not fully stabilised. Restore with `git stash pop` when
-resuming.
+## Zero-copy expert arena (2026-10-10)
+
+The reader's arena slabs are now allocated through the provider as USM shared on
+XPU, so the storage layer reads disk straight into device-visible memory and the
+SYCL expert kernel reads the same pointer. The 280 MB/layer host→USM memcpy is
+gone (measured 2.2 s/token).
+
+- `tools/xpu_moe_kernels.cpp`: `k3_xpu_alloc_shared_aligned`.
+- Provider ABI `deltafin_provider_alloc_unified_v1` / `_free_unified_v1`
+  (`provider_abi.h`, `provider_runtime.cpp`, `provider_xpu.cpp`).
+- Rust: `SessionInner::allocate_unified`/`release_unified` (`provider.rs`);
+  `UnifiedBufferHooks` threaded through `AlignedBuffer`/`SharedBuffers`/
+  `BufferArena`/`Reader` (`storage.rs`), default `None` so every other device is
+  byte-for-byte unchanged; enabled in `engine.rs` for XPU on the **demand and
+  prefetch** readers.
+- The host **pin tier is disabled on XPU**: every expert byte source (demand,
+  prefetch, pin) must be USM shared, and the pin tier allocates host pages.
+  Mixing them crashed the kernel with `UR_RESULT_ERROR_DEVICE_LOST` on the
+  scattered prefetch-hit path.
+
+## Next steps
+
+1. **Attention throughput.** Still the largest phase. The int8 projections are
+   already one SYCL kernel each; the rest is the MLA/KDA elementwise, einsum,
+   softmax and recurrent ops plus residual int8-memory streaming. Fusing the
+   MLA/KDA decode into fewer SYCL kernels, and vectorising the int8 GEMV (it
+   sits at ~12.6 GB/s against a ~33 GB/s copy ceiling — the load width is not
+   the limit, so it is latency/occupancy-bound), are the candidates.
+2. **Expert-kernel throughput.** ~13 GB/s against the same ceiling. A
+   rows-per-work-item variant that reuses the shared activation across rows,
+   and vectorised nibble decode, are the candidates. Under sustained load the
+   iGPU also throttles the kernel ~2× versus a burst harness.
+3. Phase 3: SYCL RAW_BF16 spine kernel so `--spine bf16` runs on XPU.
+4. Evidence: a native test spec for XPU, and a `PLATFORMS.md` update.
 
 ## Environment (Windows, not admin)
 
@@ -53,7 +119,7 @@ resuming.
   nightly-2026-10-07, `bin/clang++.exe -fsycl`).
 - `DELTAFIN_XPU_RUNTIME` = dir with the Intel runtime DLLs (sycl9, mkl_sycl,
   ur_*, from `intel-sycl-rt` / `onemkl-sycl-*` / `intel-openmp` wheels).
-- Build: set the three vars, then `cargo build --locked -p deltafin`.
+- Build: set the three vars, then `cargo build --locked -p deltafin --release`.
   `doctor --runtime-only` shows `xpu_devices=1 xpu_moe_compiled=yes`.
 
 Two invariants that must hold (both handled in the build graph / provider):
@@ -63,12 +129,9 @@ Two invariants that must hold (both handled in the build graph / provider):
 2. `at::xpu::getCurrentDeviceProperties` must be referenced (anchor) so the
    linker keeps the `torch_xpu.dll` import and the XPU ATen kernels register.
 
-## Next steps
+## Local iteration harness
 
-1. Stabilise the batched expert kernel (TDR), then optimise it (lookup table,
-   no `ldexp`, vectorised loads, better occupancy) toward the ~30 GB/s memory
-   floor.
-2. The attention path is the bigger cost; ATen XPU GEMV/int8-mm is the ceiling.
-   Consider SYCL attention kernels (or a faster ATen path) after the experts.
-3. Phase 3: SYCL RAW_BF16 spine kernel so `--spine bf16` runs on XPU.
-4. Evidence: a native test spec for XPU, and a `PLATFORMS.md` update.
+`C:\Users\mpathy\AppData\Local\Temp\opencode\sycl\xpu_expert_bench.cpp` links
+`tools/xpu_moe_kernels.cpp` and benchmarks the expert kernel and the int8 GEMV
+against a scalar reference without loading the 1.3 TB model. Build it with the
+same `clang++ -fsycl` flags the build graph uses (`lib.rs:3852`).

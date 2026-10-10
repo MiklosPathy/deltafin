@@ -73,6 +73,35 @@ struct CudaProviderMemorySnapshot {
 /* Compile-time feature predicates, one pair per optional device kernel. */
 bool xpu_moe_compiled() noexcept;
 bool xpu_spine_bf16_compiled() noexcept;
+bool xpu_int8_linear_compiled() noexcept;
+
+/*
+ * Row-quantized int8 projection on XPU: `input[..., K] @ weight[N, K]^T *
+ * scale[N]`. The SYCL kernel runs on torch_xpu's current stream and reads the
+ * USM allocations in place, which avoids the large per-op launch overhead of
+ * ATen's `_weight_int8pack_mm` on the integrated GPU. The caller must pass
+ * contiguous XPU tensors; otherwise the ATen op remains the fallback.
+ */
+at::Tensor xpu_int8_linear(const at::Tensor& input, const at::Tensor& weight,
+                           const at::Tensor& scale);
+
+/*
+ * Device-visible (USM shared) host allocation for the XPU expert storage
+ * arena, so the reader fills it straight from disk and the SYCL kernel reads
+ * the same pointer. Unavailable when the SYCL kernel DLL is not linked; the
+ * caller then keeps the ordinary host arena and the per-layer copy.
+ */
+bool xpu_unified_arena_available() noexcept;
+void* xpu_alloc_unified_aligned(std::size_t alignment, std::size_t bytes);
+void xpu_free_unified(void* pointer) noexcept;
+
+/*
+ * True once this process has handed out at least one unified (USM shared)
+ * expert arena. The XPU expert reader enables those hooks for every XPU
+ * session, so the routed expert bytes the provider later receives are then
+ * device-visible and can be read in place instead of copied.
+ */
+bool xpu_unified_expert_arena_active() noexcept;
 
 /* Runs the SYCL probe kernel and returns its checksum, or -1 when the XPU
  * kernel DLL is not linked. */

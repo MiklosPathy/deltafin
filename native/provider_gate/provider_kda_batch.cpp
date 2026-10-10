@@ -1,5 +1,7 @@
 #include "provider_kda_batch.h"
 
+#include "provider_cuda_moe.h"
+
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/mean.h>
@@ -142,6 +144,11 @@ at::Tensor batch_linear(const at::Tensor& input,
   }
   if (!projection.scale.defined()) {
     return at::linear(input, projection.weight, std::nullopt);
+  }
+  if (xpu_int8_linear_compiled() && input.is_xpu() &&
+      input.is_contiguous() && projection.weight.is_contiguous() &&
+      projection.scale.is_contiguous()) {
+    return xpu_int8_linear(input, projection.weight, projection.scale);
   }
   return at::_weight_int8pack_mm(input, projection.weight,
                                  projection.scale);

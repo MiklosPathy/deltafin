@@ -1,5 +1,7 @@
 #include "provider_mla.h"
 
+#include "provider_cuda_moe.h"
+
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/cat.h>
 #include <ATen/ops/einsum.h>
@@ -109,7 +111,13 @@ at::Tensor linear(const at::Tensor& input, const MlaLinearWeight& weight) {
       output = at::linear(flat, weight.data, std::nullopt);
       break;
     case MlaLinearEncoding::RowI8F32Scale:
-      output = at::_weight_int8pack_mm(flat, weight.data, weight.row_scale);
+      if (xpu_int8_linear_compiled() && flat.is_xpu() &&
+          flat.is_contiguous() && weight.data.is_contiguous() &&
+          weight.row_scale.is_contiguous()) {
+        output = xpu_int8_linear(flat, weight.data, weight.row_scale);
+      } else {
+        output = at::_weight_int8pack_mm(flat, weight.data, weight.row_scale);
+      }
       break;
     case MlaLinearEncoding::OriginalBf16:
       output = original_bf16_linear(flat, weight.original_bf16);

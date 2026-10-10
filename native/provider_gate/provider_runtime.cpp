@@ -4229,6 +4229,60 @@ extern "C" int32_t deltafin_provider_metal_expert_cache_flush_v1(
   });
 }
 
+extern "C" int32_t deltafin_provider_alloc_unified_v1(
+    const uint64_t session_handle, const uint64_t bytes,
+    const uint64_t alignment, void** out_pointer, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (out_pointer == nullptr) {
+      throw std::invalid_argument(
+          "provider unified allocation needs an out pointer");
+    }
+    *out_pointer = nullptr;
+    if (bytes == 0) {
+      throw std::invalid_argument(
+          "provider unified allocation needs a non-zero size");
+    }
+    const auto session = find_session(session_handle);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    if (!session->selected.device.is_xpu()) {
+      throw std::invalid_argument(
+          "provider unified allocation requires the selected XPU provider");
+    }
+    if (!deltafin::provider_internal::xpu_unified_arena_available()) {
+      throw std::runtime_error(
+          "provider unified allocation needs the linked SYCL kernel DLL");
+    }
+    const auto size = static_cast<std::size_t>(bytes);
+    const auto alignment_value = static_cast<std::size_t>(alignment);
+    void* pointer = deltafin::provider_internal::xpu_alloc_unified_aligned(
+        alignment_value, size);
+    if (pointer == nullptr) {
+      throw std::runtime_error("XPU unified arena allocation failed");
+    }
+    *out_pointer = pointer;
+  });
+}
+
+extern "C" int32_t deltafin_provider_free_unified_v1(
+    const uint64_t session_handle, void* pointer, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (pointer == nullptr) {
+      return;
+    }
+    const auto session = find_session(session_handle);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    if (!session->selected.device.is_xpu()) {
+      throw std::invalid_argument(
+          "provider unified release requires the selected XPU provider");
+    }
+    deltafin::provider_internal::xpu_free_unified(pointer);
+  });
+}
+
 extern "C" int32_t deltafin_provider_metal_expert_cache_stats_v1(
     const DeltafinProviderResourceRequestV1* request,
     DeltafinProviderMetalExpertCacheStatsReportV1* report, char* error,

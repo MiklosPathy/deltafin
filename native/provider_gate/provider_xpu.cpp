@@ -1,15 +1,23 @@
 #include "provider_cuda_moe.h"
 #include "provider_device.h"
 
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
+
+#include <vector>
 
 #if defined(DELTAFIN_HAVE_XPU_PROVIDER_V1)
 #include <ATen/Context.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUCachingAllocator.h>
 #include <c10/xpu/XPUFunctions.h>
+#endif
+
+// `getCurrentXPUStream` is needed by the int8 linear helper, which is available
+// whenever the SYCL expert kernel DLL is linked.
+#if defined(DELTAFIN_HAVE_XPU_PROVIDER_V1) || defined(DELTAFIN_HAVE_XPU_MOE_V1)
 #include <c10/xpu/XPUStream.h>
 #endif
 
@@ -91,6 +99,115 @@ bool xpu_spine_bf16_compiled() noexcept {
   return true;
 #else
   return false;
+#endif
+}
+
+bool xpu_int8_linear_compiled() noexcept {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  return true;
+#else
+  return false;
+#endif
+}
+
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+// The SYCL int8 GEMV entry point from `deltafin_xpu_kernels.dll`. The first
+// argument is a `sycl::queue*` (torch_xpu's current stream) so the kernel is
+// ordered with the ATen ops around it.
+extern "C" int k3_xpu_int8_gemv(void* queue_pointer, const float* x,
+                                const std::int8_t* weight, const float* scale,
+                                float* output, int rows, int cols, int batches,
+                                int row_group);
+
+// USM shared arena allocation from the same DLL, on the internal expert-kernel
+// queue/context so the expert kernel can read the arena directly.
+extern "C" void* k3_xpu_alloc_shared_aligned(std::size_t alignment,
+                                             std::size_t bytes);
+extern "C" void k3_xpu_free_shared(void* pointer);
+#endif
+
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+namespace {
+std::atomic<bool> g_unified_expert_arena{false};
+}  // namespace
+#endif
+
+bool xpu_unified_arena_available() noexcept {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool xpu_unified_expert_arena_active() noexcept {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  return g_unified_expert_arena.load(std::memory_order_relaxed);
+#else
+  return false;
+#endif
+}
+
+void* xpu_alloc_unified_aligned(std::size_t alignment, std::size_t bytes) {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  void* pointer = k3_xpu_alloc_shared_aligned(alignment, bytes);
+  if (pointer != nullptr) {
+    g_unified_expert_arena.store(true, std::memory_order_relaxed);
+  }
+  return pointer;
+#else
+  static_cast<void>(alignment);
+  static_cast<void>(bytes);
+  return nullptr;
+#endif
+}
+
+void xpu_free_unified(void* pointer) noexcept {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  if (pointer != nullptr) {
+    k3_xpu_free_shared(pointer);
+  }
+#else
+  static_cast<void>(pointer);
+#endif
+}
+
+at::Tensor xpu_int8_linear(const at::Tensor& input, const at::Tensor& weight,
+                           const at::Tensor& scale) {
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  const std::int64_t cols = input.size(-1);
+  const std::int64_t rows = weight.size(0);
+  if (!input.is_xpu() || !weight.is_xpu() || !scale.is_xpu() ||
+      input.scalar_type() != at::kFloat || weight.scalar_type() != at::kChar ||
+      scale.scalar_type() != at::kFloat || weight.dim() != 2 ||
+      weight.size(1) != cols || scale.dim() != 1 || scale.size(0) != rows ||
+      !input.is_contiguous() || !weight.is_contiguous() ||
+      !scale.is_contiguous()) {
+    throw std::invalid_argument(
+        "XPU int8 linear received incompatible tensors");
+  }
+  std::vector<std::int64_t> output_shape(input.sizes().begin(),
+                                         input.sizes().end());
+  output_shape.back() = rows;
+  const at::Tensor flat = input.reshape({-1, cols});
+  const std::int64_t batches = flat.size(0);
+  at::Tensor output = at::empty({batches, rows}, input.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(input.device().index()).queue();
+  if (k3_xpu_int8_gemv(static_cast<void*>(&queue),
+                       flat.const_data_ptr<float>(),
+                       weight.const_data_ptr<std::int8_t>(),
+                       scale.const_data_ptr<float>(), output.data_ptr<float>(),
+                       static_cast<int>(rows), static_cast<int>(cols),
+                       static_cast<int>(batches), 128) != 0) {
+    throw std::runtime_error("XPU int8 GEMV kernel failed");
+  }
+  return output.view(output_shape);
+#else
+  static_cast<void>(input);
+  static_cast<void>(weight);
+  static_cast<void>(scale);
+  throw std::runtime_error(
+      "XPU int8 linear is unavailable in this provider build");
 #endif
 }
 

@@ -1,5 +1,7 @@
 #include "provider_kda.h"
 
+#include "provider_cuda_moe.h"
+
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/conv1d.h>
 #include <ATen/ops/linear.h>
@@ -204,6 +206,11 @@ at::Tensor packed_linear(const at::Tensor& hidden,
   }
   if (!projection.scale.defined()) {
     return at::linear(hidden, projection.weight, std::nullopt);
+  }
+  if (xpu_int8_linear_compiled() && hidden.is_xpu() &&
+      hidden.is_contiguous() && projection.weight.is_contiguous() &&
+      projection.scale.is_contiguous()) {
+    return xpu_int8_linear(hidden, projection.weight, projection.scale);
   }
   return at::_weight_int8pack_mm(hidden, projection.weight,
                                  projection.scale);

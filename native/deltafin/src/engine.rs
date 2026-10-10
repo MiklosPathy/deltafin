@@ -11,6 +11,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,7 +86,7 @@ use crate::spine_runtime::SpinePipeline;
 use crate::storage_homes::StorageHomes;
 use crate::storage::{
     BufferLengths, BufferRetireHook, CachePolicy, LOOSE_SPINE_DESCRIPTOR_RESERVE, Reader,
-    prepare_persistent_descriptor_capacity,
+    UnifiedBufferHooks, prepare_persistent_descriptor_capacity,
 };
 use crate::tokenizer::K3Tokenizer;
 
@@ -1433,7 +1434,12 @@ impl NativeTargetEngine {
         // The tier is sized and charged only after residency and the Qwen
         // drafter are chosen (see the admission below), so a pin budget can
         // never silently push out a drafter or a spine that fits completely.
+        // On XPU every expert byte source (demand, prefetch, and any pin) must
+        // be device-visible USM shared; the pin tier allocates host pages, so
+        // it is disabled there and the exact demand arena carries the bytes.
+        let xpu_device = matches!(provider.device(), Device::Xpu(_));
         let requested_pin_tier = (expert_pin_budget_bytes > 0
+            && !xpu_device
             && matches!(
                 expert_backend,
                 ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
@@ -1454,10 +1460,30 @@ impl NativeTargetEngine {
                 Arc::new(move || session.flush_metal_expert_cache()) as BufferRetireHook
             });
         let metal_expert_wrapper_retention = metal_expert_retire_hook.is_some();
-        let mut expert_reader = Reader::with_arena_capacity_and_retire_hook(
+        // On XPU the expert arena is device-visible (USM shared): the reader
+        // fills it straight from disk and the SYCL expert kernel reads the same
+        // pointer, so the per-layer host->device copy disappears. Every other
+        // device keeps the ordinary Rust-allocated arena.
+        let unified_expert_hooks: Option<UnifiedBufferHooks> = xpu_device.then(|| {
+            let session = provider.lease();
+            let allocate_session = Arc::clone(&session);
+            UnifiedBufferHooks {
+                allocate: Arc::new(move |bytes, alignment| {
+                    let pointer = allocate_session.allocate_unified(bytes, alignment)?;
+                    NonNull::new(pointer).ok_or_else(|| {
+                        DeltafinError::new(
+                            "XPU unified arena allocation returned a null pointer",
+                        )
+                    })
+                }),
+                release: Arc::new(move |pointer| session.release_unified(pointer.as_ptr())),
+            }
+        });
+        let mut expert_reader = Reader::with_arena_capacity_and_hooks(
             expert_reader_workers,
             EXPERT_ARENA_SLOTS,
             metal_expert_retire_hook.clone(),
+            unified_expert_hooks.clone(),
         )?;
         expert_reader.set_storage_homes(storage_homes.clone());
         // The nine-row verifier's compact expert slab is a startup resource,
@@ -1485,10 +1511,11 @@ impl NativeTargetEngine {
             );
         let expert_prefetch_reader = expert_prefetch_enabled
             .then(|| {
-                Reader::with_arena_capacity_and_retire_hook(
+                Reader::with_arena_capacity_and_hooks(
                     expert_reader_workers,
                     EXPERT_PREFETCH_ARENA_SLOTS,
                     metal_expert_retire_hook.clone(),
+                    unified_expert_hooks,
                 )
                 .map(|mut reader| {
                     reader.set_storage_homes(storage_homes.clone());

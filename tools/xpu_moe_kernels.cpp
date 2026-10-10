@@ -44,20 +44,21 @@ std::mutex& queue_mutex() {
   return mutex;
 }
 
-inline float e2m1_value(std::uint8_t code) {
-  float magnitude;
-  switch (code & 7u) {
-    case 0: magnitude = 0.0f; break;
-    case 1: magnitude = 0.5f; break;
-    case 2: magnitude = 1.0f; break;
-    case 3: magnitude = 1.5f; break;
-    case 4: magnitude = 2.0f; break;
-    case 5: magnitude = 3.0f; break;
-    case 6: magnitude = 4.0f; break;
-    default: magnitude = 6.0f; break;
-  }
+// e2m1 decode for every 4-bit code, so the inner loop is a table lookup rather
+// than a switch. The sign bit is bit 3; the magnitude table is indexed by the
+// low three bits and negated for negative codes.
+constexpr float kE2M1Magnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                                     2.0f, 3.0f,  4.0f, 6.0f};
+
+inline float e2m1_lookup(std::uint8_t code) {
+  const float magnitude = kE2M1Magnitude[code & 7u];
   return (code & 8u) ? -magnitude : magnitude;
 }
+
+// One output row is computed by a work-group of this many work-items, each
+// striding over the 32-element scale groups. Small groups keep the iGPU's few
+// hardware threads busy without paying a wide cross-subgroup reduction.
+constexpr int kRowGroup = 32;
 
 }  // namespace
 
@@ -69,6 +70,10 @@ K3_XPU_EXPORT std::int32_t k3_xpu_probe();
 // USM shared allocation: host-writable and device-readable, so a disk read and
 // the device kernel share one pointer with no copy.
 K3_XPU_EXPORT void* k3_xpu_alloc_shared(std::size_t bytes);
+// Aligned sibling used by the storage arena (the reader requires the buffer
+// alignment its host allocator guaranteed).
+K3_XPU_EXPORT void* k3_xpu_alloc_shared_aligned(std::size_t alignment,
+                                                std::size_t bytes);
 K3_XPU_EXPORT void k3_xpu_free_shared(void* pointer);
 
 // Expert MXFP4 GEMV. `packed` is rows x cols/2 nibbles, `scales` is rows x
@@ -81,6 +86,30 @@ K3_XPU_EXPORT int k3_xpu_mxfp4_gemv(
     int rows,
     int cols,
     int batches);
+
+// Batched form: `n_mats` independent rows[m] x cols[m] matrices, each with its
+// own packed/scales/x/output. One kernel launch covers every matrix, which
+// matters because a per-expert launch is otherwise launch-overhead bound.
+K3_XPU_EXPORT int k3_xpu_mxfp4_gemm_batch(
+    const std::uint8_t* const* packed,
+    const std::uint8_t* const* scales,
+    const float* const* x,
+    float* const* output,
+    const int* rows,
+    const int* cols,
+    int n_mats);
+
+// Row-quantized int8 GEMV with a per-output-channel fp32 scale:
+//   output[b,n] = scale[n] * sum_k x[b,k] * weight[n,k].
+// `queue_pointer` is a `sycl::queue*` supplied by the caller (torch_xpu's
+// current stream) so the kernel is ordered with the ATen ops that produce the
+// input; a null pointer selects the internal default queue. `x` and `weight`
+// may be torch_xpu USM allocations: the iGPU shares host memory, so the kernel
+// reads them without a copy.
+K3_XPU_EXPORT int k3_xpu_int8_gemv(
+    void* queue_pointer, const float* x, const std::int8_t* weight,
+    const float* scale, float* output, int rows, int cols, int batches,
+    int row_group);
 
 K3_XPU_EXPORT void k3_xpu_moe_shapes(int* hidden, int* intermediate, std::int64_t* expert_span);
 
@@ -106,6 +135,15 @@ K3_XPU_EXPORT std::int32_t k3_xpu_probe() {
 K3_XPU_EXPORT void* k3_xpu_alloc_shared(std::size_t bytes) {
   std::lock_guard<std::mutex> lock(queue_mutex());
   return sycl::malloc_shared(bytes, device_queue());
+}
+
+K3_XPU_EXPORT void* k3_xpu_alloc_shared_aligned(std::size_t alignment,
+                                                std::size_t bytes) {
+  std::lock_guard<std::mutex> lock(queue_mutex());
+  if (alignment == 0) {
+    alignment = 64;
+  }
+  return sycl::aligned_alloc_shared(alignment, bytes, device_queue());
 }
 
 K3_XPU_EXPORT void k3_xpu_free_shared(void* pointer) {
@@ -163,7 +201,7 @@ K3_XPU_EXPORT int k3_xpu_mxfp4_gemv(
                     row_packed[packed_base + (lane >> 1)];
                 const std::uint8_t code = static_cast<std::uint8_t>(
                     (byte >> ((lane & 1) * 4)) & 0x0f);
-                const float weight = std::ldexp(e2m1_value(code), exponent);
+                const float weight = std::ldexp(e2m1_lookup(code), exponent);
                 local = std::fma(weight, batch_x[column_base + lane], local);
               }
             }
@@ -175,6 +213,135 @@ K3_XPU_EXPORT int k3_xpu_mxfp4_gemv(
             }
           })
       .wait();
+  return 0;
+}
+
+K3_XPU_EXPORT int k3_xpu_mxfp4_gemm_batch(
+    const std::uint8_t* const* packed,
+    const std::uint8_t* const* scales,
+    const float* const* x,
+    float* const* output,
+    const int* rows,
+    const int* cols,
+    int n_mats) {
+  if (packed == nullptr || scales == nullptr || x == nullptr ||
+      output == nullptr || rows == nullptr || cols == nullptr || n_mats <= 0) {
+    return -1;
+  }
+  int total = 0;
+  for (int m = 0; m < n_mats; ++m) {
+    if (rows[m] <= 0 || cols[m] <= 0 || (cols[m] % 32) != 0) {
+      return -1;
+    }
+    total += rows[m];
+  }
+  std::lock_guard<std::mutex> lock(queue_mutex());
+  auto& queue = device_queue();
+  // One work-group per output row. Each work-item strides over the row's 32-wide
+  // scale groups and folds in one group at a time; the group scale is a single
+  // `ldexp` per 32 weights rather than one per element, and the e2m1 decode is a
+  // table lookup. The per-row partials are tree-reduced across the work-group.
+  queue
+      .parallel_for(
+          sycl::nd_range<1>(
+              sycl::range<1>(static_cast<std::size_t>(total) *
+                             static_cast<std::size_t>(kRowGroup)),
+              sycl::range<1>(static_cast<std::size_t>(kRowGroup))),
+          [=](sycl::nd_item<1> item) {
+            const int row_index = static_cast<int>(item.get_group(0));
+            const int tid = static_cast<int>(item.get_local_id(0));
+            int matrix = 0;
+            int base = 0;
+            for (; matrix < n_mats; ++matrix) {
+              if (row_index < base + rows[matrix]) {
+                break;
+              }
+              base += rows[matrix];
+            }
+            const int row = row_index - base;
+            const int cols_m = cols[matrix];
+            const int groups = cols_m / 32;
+            const std::uint8_t* row_packed =
+                packed[matrix] + static_cast<std::int64_t>(row) * (cols_m / 2);
+            const std::uint8_t* row_scales =
+                scales[matrix] + static_cast<std::int64_t>(row) * groups;
+            const float* batch_x = x[matrix];
+            float local = 0.0f;
+            for (int group = tid; group < groups; group += kRowGroup) {
+              const std::uint8_t scale_byte = row_scales[group];
+              if (scale_byte == 255u) {
+                local = std::numeric_limits<float>::quiet_NaN();
+                break;
+              }
+              const float scale =
+                  sycl::ldexp(1.0f, static_cast<int>(scale_byte) - 127);
+              const std::uint8_t* packed_group = row_packed + group * 16;
+              const float* x_group = batch_x + group * 32;
+              for (int lane = 0; lane < 32; ++lane) {
+                const std::uint8_t byte = packed_group[lane >> 1];
+                const std::uint8_t code = static_cast<std::uint8_t>(
+                    (byte >> ((lane & 1) * 4)) & 0x0f);
+                local = sycl::fma(e2m1_lookup(code) * scale, x_group[lane],
+                                  local);
+              }
+            }
+            const float row_sum = sycl::reduce_over_group(
+                item.get_group(), local, sycl::plus<float>());
+            if (tid == 0) {
+              output[matrix][row] = row_sum;
+            }
+          })
+      .wait();
+  return 0;
+}
+
+K3_XPU_EXPORT int k3_xpu_int8_gemv(
+    void* queue_pointer, const float* x, const std::int8_t* weight,
+    const float* scale, float* output, int rows, int cols, int batches,
+    int row_group) {
+  if (x == nullptr || weight == nullptr || scale == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || batches <= 0) {
+    return -1;
+  }
+  if (row_group <= 0) {
+    row_group = 128;
+  }
+  const bool external = queue_pointer != nullptr;
+  sycl::queue* queue =
+      external ? static_cast<sycl::queue*>(queue_pointer) : &device_queue();
+  std::lock_guard<std::mutex> lock(queue_mutex());
+  auto event = queue->parallel_for(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<std::size_t>(rows) *
+                         static_cast<std::size_t>(batches) *
+                         static_cast<std::size_t>(row_group)),
+          sycl::range<1>(static_cast<std::size_t>(row_group))),
+      [=](sycl::nd_item<1> item) {
+        const int block = static_cast<int>(item.get_group(0));
+        const int tid = static_cast<int>(item.get_local_id(0));
+        const int n = block % rows;
+        const int batch = block / rows;
+        const std::int8_t* weight_row =
+            weight + static_cast<std::int64_t>(n) * cols;
+        const float* x_row = x + static_cast<std::int64_t>(batch) * cols;
+        float local = 0.0f;
+        for (int k = tid; k < cols; k += row_group) {
+          local =
+              sycl::fma(x_row[k], static_cast<float>(weight_row[k]), local);
+        }
+        const float sum = sycl::reduce_over_group(item.get_group(), local,
+                                                  sycl::plus<float>());
+        if (tid == 0) {
+          output[static_cast<std::int64_t>(batch) * rows + n] = sum * scale[n];
+        }
+      });
+  // On the caller's (torch_xpu) in-order stream the kernel is already ordered
+  // with the ATen ops around it, so waiting here would only stall the host and
+  // break the GPU's pipelining. The internal default queue is not ordered with
+  // any caller, so it must complete before returning.
+  if (!external) {
+    event.wait();
+  }
   return 0;
 }
 

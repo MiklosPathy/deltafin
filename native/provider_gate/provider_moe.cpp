@@ -61,6 +61,10 @@ void k3_xpu_free_shared(void* pointer);
 int k3_xpu_mxfp4_gemv(const std::uint8_t* packed, const std::uint8_t* scales,
                       const float* x, float* output, int rows, int cols,
                       int batches);
+int k3_xpu_mxfp4_gemm_batch(const std::uint8_t* const* packed,
+                            const std::uint8_t* const* scales,
+                            const float* const* x, float* const* output,
+                            const int* rows, const int* cols, int n_mats);
 }
 #endif
 
@@ -552,6 +556,11 @@ at::Tensor row_int8_linear(const at::Tensor& input,
     // Qualification happens once at session/device admission. A provider that
     // later rejects this exact call must fail the layer transaction; silently
     // changing arithmetic after routing would make diagnosis impossible.
+    if (xpu_int8_linear_compiled() && input.is_xpu() &&
+        input.is_contiguous() && matrix.quantized.is_contiguous() &&
+        matrix.row_scales.is_contiguous()) {
+      return xpu_int8_linear(input, matrix.quantized, matrix.row_scales);
+    }
     return at::_weight_int8pack_mm(input, matrix.quantized,
                                    matrix.row_scales);
   }
@@ -1087,8 +1096,6 @@ at::Tensor execute_xpu(const PreparedMoeT1& prepared,
   static thread_local void* out_slot = nullptr;
   static thread_local std::size_t out_cap = 0;
 
-  auto* blob_shared = static_cast<std::uint8_t*>(
-      shared_scratch(&blob_slot, &blob_cap, kMoeRouteTopK * span));
   auto* input_shared = static_cast<float*>(shared_scratch(
       &input_slot, &input_cap, static_cast<std::size_t>(hidden) * 4));
   auto* gate_shared = static_cast<float*>(shared_scratch(
@@ -1099,26 +1106,55 @@ at::Tensor execute_xpu(const PreparedMoeT1& prepared,
   auto* out_shared = static_cast<float*>(shared_scratch(
       &out_slot, &out_cap, kMoeRouteTopK * static_cast<std::size_t>(hidden) * 4));
 
-  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
-    std::memcpy(blob_shared + edge * span, blobs[edge], span);
+  // When the reader's expert arena is device-visible (USM shared on XPU) the
+  // kernel reads the routed bytes in place. Otherwise they are staged into a
+  // USM shared slab, which the device can address.
+  std::array<const std::uint8_t*, kMoeRouteTopK> blob_ptrs{};
+  if (deltafin::provider_internal::xpu_unified_expert_arena_active()) {
+    blob_ptrs = blobs;
+  } else {
+    auto* blob_shared = static_cast<std::uint8_t*>(
+        shared_scratch(&blob_slot, &blob_cap, kMoeRouteTopK * span));
+    for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+      std::memcpy(blob_shared + edge * span, blobs[edge], span);
+      blob_ptrs[edge] = blob_shared + edge * span;
+    }
   }
   std::memcpy(input_shared, input.const_data_ptr<float>(),
               static_cast<std::size_t>(hidden) * 4);
 
   record_trace(options.execution_trace, MoeExecutionStage::XpuExpertDispatch);
-  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
-    const std::uint8_t* blob = blob_shared + edge * span;
-    if (k3_xpu_mxfp4_gemv(blob + offsets.w1_packed, blob + offsets.w1_scales,
-                          input_shared, gate_shared + (2 * edge) * inter,
-                          static_cast<int>(inter), static_cast<int>(hidden),
-                          1) != 0) {
-      throw std::runtime_error("XPU MXFP4 w1 GEMV failed");
+  // The batch pointer/int arrays must live in USM shared memory: the device
+  // dereferences them, and a host stack array is not device-accessible.
+  static thread_local void* arr_slot = nullptr;
+  static thread_local std::size_t arr_cap = 0;
+  auto* arr = static_cast<std::uint8_t*>(shared_scratch(&arr_slot, &arr_cap, 8192));
+  auto* packed13 = reinterpret_cast<const std::uint8_t**>(arr);
+  auto* scales13 = reinterpret_cast<const std::uint8_t**>(arr + 512);
+  auto* x13 = reinterpret_cast<const float**>(arr + 1024);
+  auto* out13 = reinterpret_cast<float**>(arr + 1536);
+  auto* rows13 = reinterpret_cast<int*>(arr + 2048);
+  auto* cols13 = reinterpret_cast<int*>(arr + 2560);
+  {
+    constexpr int matrices = 2 * static_cast<int>(kMoeRouteTopK);
+    for (int e = 0; e < static_cast<int>(kMoeRouteTopK); ++e) {
+      const std::uint8_t* blob = blob_ptrs[static_cast<std::size_t>(e)];
+      packed13[2 * e] = blob + offsets.w1_packed;
+      scales13[2 * e] = blob + offsets.w1_scales;
+      packed13[2 * e + 1] = blob + offsets.w3_packed;
+      scales13[2 * e + 1] = blob + offsets.w3_scales;
+      x13[2 * e] = input_shared;
+      x13[2 * e + 1] = input_shared;
+      out13[2 * e] = gate_shared + (2 * e) * inter;
+      out13[2 * e + 1] = gate_shared + (2 * e + 1) * inter;
+      rows13[2 * e] = static_cast<int>(inter);
+      rows13[2 * e + 1] = static_cast<int>(inter);
+      cols13[2 * e] = static_cast<int>(hidden);
+      cols13[2 * e + 1] = static_cast<int>(hidden);
     }
-    if (k3_xpu_mxfp4_gemv(blob + offsets.w3_packed, blob + offsets.w3_scales,
-                          input_shared, gate_shared + (2 * edge + 1) * inter,
-                          static_cast<int>(inter), static_cast<int>(hidden),
-                          1) != 0) {
-      throw std::runtime_error("XPU MXFP4 w3 GEMV failed");
+    if (k3_xpu_mxfp4_gemm_batch(packed13, scales13, x13, out13, rows13, cols13,
+                                matrices) != 0) {
+      throw std::runtime_error("XPU MXFP4 w1/w3 batch GEMV failed");
     }
   }
 
@@ -1132,13 +1168,20 @@ at::Tensor execute_xpu(const PreparedMoeT1& prepared,
   std::memcpy(act_shared, activated.const_data_ptr<float>(),
               kMoeRouteTopK * static_cast<std::size_t>(inter) * 4);
 
-  for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
-    const std::uint8_t* blob = blob_shared + edge * span;
-    if (k3_xpu_mxfp4_gemv(blob + offsets.w2_packed, blob + offsets.w2_scales,
-                          act_shared + edge * inter, out_shared + edge * hidden,
-                          static_cast<int>(hidden), static_cast<int>(inter),
-                          1) != 0) {
-      throw std::runtime_error("XPU MXFP4 w2 GEMV failed");
+  {
+    constexpr int matrices = static_cast<int>(kMoeRouteTopK);
+    for (int e = 0; e < matrices; ++e) {
+      const std::uint8_t* blob = blob_ptrs[static_cast<std::size_t>(e)];
+      packed13[e] = blob + offsets.w2_packed;
+      scales13[e] = blob + offsets.w2_scales;
+      x13[e] = act_shared + static_cast<std::size_t>(e) * inter;
+      out13[e] = out_shared + static_cast<std::size_t>(e) * hidden;
+      rows13[e] = static_cast<int>(hidden);
+      cols13[e] = static_cast<int>(inter);
+    }
+    if (k3_xpu_mxfp4_gemm_batch(packed13, scales13, x13, out13, rows13, cols13,
+                                matrices) != 0) {
+      throw std::runtime_error("XPU MXFP4 w2 batch GEMV failed");
     }
   }
 

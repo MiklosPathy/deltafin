@@ -1,5 +1,7 @@
 #include "provider_target.h"
 
+#include "provider_cuda_moe.h"
+
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/add.h>
 #include <ATen/ops/cat.h>
@@ -106,6 +108,11 @@ std::int64_t linear_rows(const MoeRowInt8Matrix &matrix) {
 at::Tensor linear(const at::Tensor &input, const MoeRowInt8Matrix &weight,
                   const bool packed) {
   if (packed) {
+    if (xpu_int8_linear_compiled() && input.is_xpu() &&
+        input.is_contiguous() && weight.quantized.is_contiguous() &&
+        weight.row_scales.is_contiguous()) {
+      return xpu_int8_linear(input, weight.quantized, weight.row_scales);
+    }
     return at::_weight_int8pack_mm(input, weight.quantized, weight.row_scales);
   }
   if (weight.original_bf16.defined()) {

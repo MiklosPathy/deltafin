@@ -1766,6 +1766,29 @@ int32_t deltafin_provider_metal_expert_cache_stats_v1(
     char* error,
     size_t error_capacity);
 
+/*
+ * Device-visible (USM shared) host arena allocation for the XPU expert
+ * storage. The reader fills the returned buffer straight from disk and the
+ * SYCL expert kernel reads the same pointer, so the per-layer host->device
+ * copy disappears. Requires an open XPU provider session with the SYCL kernel
+ * DLL linked; otherwise the call fails and the caller keeps the host arena.
+ * The returned pointer must be released with the matching free call on the
+ * same session.
+ */
+int32_t deltafin_provider_alloc_unified_v1(
+    uint64_t session,
+    uint64_t bytes,
+    uint64_t alignment,
+    void** out_pointer,
+    char* error,
+    size_t error_capacity);
+
+int32_t deltafin_provider_free_unified_v1(
+    uint64_t session,
+    void* pointer,
+    char* error,
+    size_t error_capacity);
+
 int32_t deltafin_provider_tensor_upload_f32_v1(
     const DeltafinProviderTensorUploadF32V1* request,
     DeltafinProviderTensorReportV1* report,
