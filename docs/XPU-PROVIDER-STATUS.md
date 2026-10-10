@@ -98,12 +98,15 @@ gone (measured 2.2 s/token).
 
 ## Next steps
 
-1. **Attention throughput.** Still the largest phase. The int8 projections are
-   already one SYCL kernel each; the rest is the MLA/KDA elementwise, einsum,
-   softmax and recurrent ops plus residual int8-memory streaming. Fusing the
-   MLA/KDA decode into fewer SYCL kernels, and vectorising the int8 GEMV (it
-   sits at ~12.6 GB/s against a ~33 GB/s copy ceiling — the load width is not
-   the limit, so it is latency/occupancy-bound), are the candidates.
+1. **Attention throughput.** Still the largest phase. Instrumentation shows
+   **~1000 int8 GEMVs/token and ~44 GB of int8 weights/token**; at the measured
+   ~12 GB/s that is ~3.5 s/token, so roughly half the attention phase is int8
+   streaming and half is the MLA/KDA elementwise, einsum, softmax and recurrent
+   ops. The int8 GEMV plateaus at ~10-12 GB/s across work-group sizes (8..256)
+   and both scalar and 4-wide-unrolled inner loops, against a ~33 GB/s copy
+   ceiling — it is not load-width-bound, so it is memory-latency/occupancy-bound
+   on this iGPU. Candidates: a transposed/batched weight layout, and fusing the
+   MLA/KDA decode into fewer SYCL kernels.
 2. **Expert-kernel throughput.** ~13 GB/s against the same ceiling. A
    rows-per-work-item variant that reuses the shared activation across rows,
    and vectorised nibble decode, are the candidates. Under sustained load the
