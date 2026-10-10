@@ -411,6 +411,16 @@ pub const NATIVE_TEST_SPECS: &[NativeTestSpec] = &[
         timeout_seconds: 300,
     },
     NativeTestSpec {
+        name: "xpu",
+        platform: NativeTestPlatform::Any,
+        main_source: "native/provider_gate/provider_xpu_test.cpp",
+        extra_sources: &[],
+        provider: ProviderFlavor::Production,
+        cases: DEFAULT_CASES,
+        pass_marker: "provider_xpu.synthetic=PASS",
+        timeout_seconds: 300,
+    },
+    NativeTestSpec {
         name: "pilot",
         platform: NativeTestPlatform::Any,
         main_source: "native/provider_gate/provider_pilot_test.cpp",
@@ -1318,6 +1328,23 @@ fn build_provider_artifacts(
             }
         }
     }
+    if gpu_runtime == Some(GpuRuntime::Xpu) {
+        // The SYCL toolchain runtime, the Intel XPU runtime DLLs, and the SYCL
+        // kernel DLL must all be reachable by a provider test executable.
+        if let Some(root) = sycl_root() {
+            for extra in ["bin", "lib"] {
+                let directory = root.join(extra);
+                if directory.is_dir() {
+                    guard.loader_directories.push(directory);
+                }
+            }
+        }
+        for directory in xpu_runtime_directories() {
+            if directory.is_dir() {
+                guard.loader_directories.push(directory);
+            }
+        }
+    }
     validate_compiler(&toolchain, &toolchain.cc, "C", &guard);
     validate_compiler(&toolchain, &toolchain.cxx, "C++", &guard);
 
@@ -1347,6 +1374,11 @@ fn build_provider_artifacts(
     let xpu_kernels = (gpu_runtime == Some(GpuRuntime::Xpu)).then(|| {
         build_xpu_kernels(repository, &native_build, &guard, emit_cargo_metadata)
     }).flatten();
+    if xpu_kernels.is_some() {
+        // `deltafin_xpu_kernels.dll` is imported by the provider archive, so a
+        // test executable must find it beside the built provider objects.
+        guard.loader_directories.push(native_build.clone());
+    }
     let mut definitions = vec!["DELTAFIN_HAVE_MXFP4_CPU_V1=1"];
     if cuda_provider.is_some() {
         definitions.push("DELTAFIN_HAVE_CUDA_PROVIDER_V1=1");
@@ -1806,6 +1838,17 @@ fn link_provider_test_msvc(
         directories.push(cuda.runtime_directory.as_path());
         libraries.push("cudart.lib");
     }
+    if provider.gpu_runtime == Some(GpuRuntime::Xpu) {
+        // XPU LibTorch plus the self-contained SYCL kernel import library; the
+        // DLL itself is found at run time through the guard loader path.
+        if library_file(&provider.torch_lib, "torch_xpu").is_some() {
+            libraries.extend(["torch_xpu.lib", "c10_xpu.lib"]);
+        }
+        if provider.xpu_kernels.is_some() {
+            directories.push(provider.native_build.as_path());
+            libraries.push("deltafin_xpu_kernels.lib");
+        }
+    }
     let mut link = Command::new(linker);
     link.args(msvc::link_args(
         objects,
@@ -2097,6 +2140,20 @@ fn audit_transitive_dependencies(
         .filter(|cuda| cuda.runtime == KernelRuntime::Hip)
     {
         roots.push(cuda.runtime_directory.clone());
+    }
+    if provider.gpu_runtime == Some(GpuRuntime::Xpu) {
+        // The SYCL kernel DLL and the SYCL/Intel runtime it imports live
+        // outside LibTorch.
+        roots.push(provider.native_build.clone());
+        if let Some(root) = sycl_root() {
+            for extra in ["bin", "lib"] {
+                let directory = root.join(extra);
+                if directory.is_dir() {
+                    roots.push(directory);
+                }
+            }
+        }
+        roots.extend(xpu_runtime_directories());
     }
     audit_dependency_graph(executable, &roots, build, &provider.guard)
 }

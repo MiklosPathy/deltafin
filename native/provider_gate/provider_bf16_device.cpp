@@ -1,9 +1,13 @@
 #include "provider_bf16_device.h"
 
+#include "provider_cuda_moe.h"
 #include "provider_precision.h"
 #include "provider_spine_bf16_cuda.h"
 #if defined(__APPLE__)
 #include "provider_spine_bf16_metal.h"
+#endif
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+#include <c10/xpu/XPUStream.h>
 #endif
 
 #include <cstdint>
@@ -64,6 +68,70 @@ private:
   std::unique_ptr<CudaSpineBf16PreparedLayer> prepared_;
 };
 
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+// The SYCL original-BF16 GEMV from `deltafin_xpu_kernels.dll`. It runs on
+// torch_xpu's current stream and reads the raw BF16 bit patterns in place, so
+// the original weights are never expanded to FP32.
+extern "C" int k3_xpu_bf16_gemv(void* queue_pointer, const std::uint16_t* weight,
+                                const float* x, float* output, int rows,
+                                int cols, int batches, int row_group);
+
+class XpuExactBf16Backend final : public ExactBf16ProjectionBackend {
+public:
+  XpuExactBf16Backend(const at::Device &device, at::Tensor storage)
+      : device_(device), storage_(std::move(storage)) {
+    if (!device_.is_xpu() || !storage_.defined()) {
+      throw std::invalid_argument(
+          "XPU exact-BF16 backend received invalid prepared storage");
+    }
+  }
+
+  [[nodiscard]] bool
+  matches_device(const at::Device &device) const noexcept override {
+    return device == device_;
+  }
+
+  [[nodiscard]] at::Tensor
+  linear(const at::Tensor &input, const std::size_t element_offset,
+         const std::size_t rows, const std::size_t columns) override {
+    if (rows == 0 || columns == 0 ||
+        element_offset >
+            static_cast<std::size_t>(storage_.size(0)) ||
+        rows > std::numeric_limits<std::size_t>::max() / columns ||
+        element_offset + rows * columns >
+            static_cast<std::size_t>(storage_.size(0)) ||
+        !input.is_contiguous() || input.scalar_type() != at::kFloat ||
+        input.device() != device_) {
+      throw std::invalid_argument(
+          "XPU exact-BF16 projection received an invalid matrix view");
+    }
+    const std::int64_t positions = input.size(0);
+    if (positions < 1 ||
+        positions > static_cast<std::int64_t>(kBf16CpuMaximumPositions)) {
+      throw std::invalid_argument(
+          "XPU exact-BF16 projection position count is outside 1..64");
+    }
+    at::Tensor output = at::empty(
+        {positions, static_cast<std::int64_t>(rows)}, input.options());
+    auto& queue = c10::xpu::getCurrentXPUStream(device_.index()).queue();
+    if (k3_xpu_bf16_gemv(
+            static_cast<void*>(&queue),
+            reinterpret_cast<const std::uint16_t*>(
+                storage_.const_data_ptr<std::int16_t>() + element_offset),
+            input.const_data_ptr<float>(), output.data_ptr<float>(),
+            static_cast<int>(rows), static_cast<int>(columns),
+            static_cast<int>(positions), 128) != 0) {
+      throw std::runtime_error("XPU BF16 spine GEMV kernel failed");
+    }
+    return output;
+  }
+
+private:
+  at::Device device_;
+  at::Tensor storage_;
+};
+#endif
+
 #if defined(__APPLE__)
 class MetalExactBf16Backend final : public ExactBf16ProjectionBackend {
 public:
@@ -105,13 +173,18 @@ private:
 
 struct ExactBf16DeviceProjector::Impl {
   explicit Impl(const at::Device &selected) : device(selected) {
-    if (!device.is_mps() && !device.is_cuda()) {
+    if (!device.is_mps() && !device.is_cuda() && !device.is_xpu()) {
       throw std::invalid_argument(
-          "exact-BF16 device projector requires MPS or CUDA");
+          "exact-BF16 device projector requires MPS, CUDA, or XPU");
     }
     if (device.is_cuda()) {
       enforce_authoritative_cuda_fp32_precision();
       cuda = std::make_unique<CudaSpineBf16Projector>(device);
+    }
+    if (device.is_xpu() &&
+        !deltafin::provider_internal::xpu_spine_bf16_compiled()) {
+      throw std::runtime_error(
+          "XPU exact-BF16 unavailable: the SYCL spine kernel is not linked");
     }
   }
 
@@ -172,8 +245,10 @@ ExactBf16DeviceProjector::~ExactBf16DeviceProjector() = default;
 at::ScalarType ExactBf16DeviceProjector::storage_scalar_type() const noexcept {
   // Signed 16-bit storage is universally supported by CUDA tensor copies and
   // preserves every raw bit when both source and target use the same dtype.
-  // MPS UInt16 support is physically covered by the retained-carrier test.
-  return impl_->device.is_cuda() ? at::kShort : at::kUInt16;
+  // XPU shares it; MPS UInt16 support is physically covered by the retained-
+  // carrier test.
+  return (impl_->device.is_cuda() || impl_->device.is_xpu()) ? at::kShort
+                                                             : at::kUInt16;
 }
 
 std::shared_ptr<ExactBf16Storage>
@@ -203,6 +278,17 @@ ExactBf16DeviceProjector::prepare(at::Tensor storage) {
         }));
     return exact;
   }
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
+  if (impl_->device.is_xpu()) {
+    if (!deltafin::provider_internal::xpu_spine_bf16_compiled()) {
+      throw std::runtime_error(
+          "XPU exact-BF16 unavailable: the SYCL spine kernel is not linked");
+    }
+    exact->projection_backend = std::make_shared<XpuExactBf16Backend>(
+        impl_->device, exact->tensor);
+    return exact;
+  }
+#endif
 #if defined(__APPLE__)
   impl_->require_metal_qualified();
   exact->projection_backend = std::make_shared<MetalExactBf16Backend>(

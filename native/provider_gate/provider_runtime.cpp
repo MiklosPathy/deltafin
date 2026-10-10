@@ -703,7 +703,8 @@ struct Session {
 
   deltafin::provider_internal::ExactBf16DeviceProjector&
   exact_bf16_device_projector() {
-    if (!selected.device.is_mps() && !selected.device.is_cuda()) {
+    if (!selected.device.is_mps() && !selected.device.is_cuda() &&
+        !selected.device.is_xpu()) {
       throw std::logic_error(
           "exact BF16 accelerator projector requested on CPU");
     }
@@ -3522,7 +3523,7 @@ std::unique_ptr<SpineLayerSlot> upload_validated_spine_payload(
   std::vector<SpineComponentPlan> components;
   std::vector<std::size_t> ordered_components;
   const at::ScalarType exact_bf16_type =
-      device.is_cuda() ? at::kShort : at::kUInt16;
+      (device.is_cuda() || device.is_xpu()) ? at::kShort : at::kUInt16;
   auto runs = mps_three_slab
       ? std::vector<SpineUploadRun>()
       : plan_spine_uploads(descriptors, gather_mla_inputs,

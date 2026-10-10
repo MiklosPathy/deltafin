@@ -10,6 +10,7 @@
 
 #if defined(DELTAFIN_HAVE_XPU_PROVIDER_V1)
 #include <ATen/Context.h>
+#include <ATen/xpu/XPUContext.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUCachingAllocator.h>
 #include <c10/xpu/XPUFunctions.h>
@@ -24,6 +25,13 @@
 namespace deltafin::provider_internal {
 
 #if defined(DELTAFIN_HAVE_XPU_PROVIDER_V1)
+// A second torch_xpu anchor, in the translation unit the int8/arena helpers
+// already pull in. An isolated provider test that only calls `xpu_int8_linear`
+// would otherwise dead-strip the `torch_xpu.dll` import (and with it the XPU
+// ATen kernel registrations) that `provider_abi.cpp`'s anchor keeps in the
+// main executable.
+decltype(&at::xpu::getCurrentDeviceProperties) k3_xpu_anchor =
+    &at::xpu::getCurrentDeviceProperties;
 
 CudaProviderMemorySnapshot xpu_provider_memory_snapshot(
     const at::Device& device, const bool trim_unused) {
@@ -95,7 +103,9 @@ bool xpu_moe_compiled() noexcept {
 }
 
 bool xpu_spine_bf16_compiled() noexcept {
-#if defined(DELTAFIN_HAVE_XPU_SPINE_BF16_V1)
+  // The BF16 spine GEMV lives in the same SYCL kernel DLL as the MXFP4 expert
+  // kernel, so it is present exactly when that DLL is linked.
+#if defined(DELTAFIN_HAVE_XPU_MOE_V1)
   return true;
 #else
   return false;

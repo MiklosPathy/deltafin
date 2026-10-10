@@ -111,6 +111,14 @@ K3_XPU_EXPORT int k3_xpu_int8_gemv(
     const float* scale, float* output, int rows, int cols, int batches,
     int row_group);
 
+// Original-BF16 spine GEMV: `output[b,n] = sum_k bf16(weight[n,k]) * x[b,k]`.
+// The weight is the raw BF16 bit pattern (`uint16`), decoded as the top 16 bits
+// of an fp32 (`bits << 16`), so the original weights are never expanded to
+// FP32. Same queue/stream contract as the int8 GEMV.
+K3_XPU_EXPORT int k3_xpu_bf16_gemv(
+    void* queue_pointer, const std::uint16_t* weight, const float* x,
+    float* output, int rows, int cols, int batches, int row_group);
+
 K3_XPU_EXPORT void k3_xpu_moe_shapes(int* hidden, int* intermediate, std::int64_t* expert_span);
 
 }  // extern "C"
@@ -339,6 +347,52 @@ K3_XPU_EXPORT int k3_xpu_int8_gemv(
   // with the ATen ops around it, so waiting here would only stall the host and
   // break the GPU's pipelining. The internal default queue is not ordered with
   // any caller, so it must complete before returning.
+  if (!external) {
+    event.wait();
+  }
+  return 0;
+}
+
+K3_XPU_EXPORT int k3_xpu_bf16_gemv(
+    void* queue_pointer, const std::uint16_t* weight, const float* x,
+    float* output, int rows, int cols, int batches, int row_group) {
+  if (weight == nullptr || x == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || batches <= 0) {
+    return -1;
+  }
+  if (row_group <= 0) {
+    row_group = 128;
+  }
+  const bool external = queue_pointer != nullptr;
+  sycl::queue* queue =
+      external ? static_cast<sycl::queue*>(queue_pointer) : &device_queue();
+  std::lock_guard<std::mutex> lock(queue_mutex());
+  auto event = queue->parallel_for(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<std::size_t>(rows) *
+                         static_cast<std::size_t>(batches) *
+                         static_cast<std::size_t>(row_group)),
+          sycl::range<1>(static_cast<std::size_t>(row_group))),
+      [=](sycl::nd_item<1> item) {
+        const int block = static_cast<int>(item.get_group(0));
+        const int tid = static_cast<int>(item.get_local_id(0));
+        const int n = block % rows;
+        const int batch = block / rows;
+        const std::uint16_t* weight_row =
+            weight + static_cast<std::int64_t>(n) * cols;
+        const float* x_row = x + static_cast<std::int64_t>(batch) * cols;
+        float local = 0.0f;
+        for (int k = tid; k < cols; k += row_group) {
+          const float decoded = sycl::bit_cast<float>(
+              static_cast<std::uint32_t>(weight_row[k]) << 16);
+          local = sycl::fma(decoded, x_row[k], local);
+        }
+        const float sum = sycl::reduce_over_group(item.get_group(), local,
+                                                  sycl::plus<float>());
+        if (tid == 0) {
+          output[static_cast<std::int64_t>(batch) * rows + n] = sum;
+        }
+      });
   if (!external) {
     event.wait();
   }
