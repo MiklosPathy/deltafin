@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -28,6 +29,12 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime_api.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#else
+#include <cstdlib>
+#endif
 // Force an import of torch_cuda.dll (see the spine source for why).
 decltype(&at::cuda::getCurrentDeviceProperties) k3_torch_cuda_anchor_moe =
     &at::cuda::getCurrentDeviceProperties;
@@ -55,6 +62,71 @@ int k3_cuda_moe_launch(const std::uint8_t* expert_span, const float* x,
 #endif
 
 namespace deltafin::provider_internal {
+
+#if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
+std::atomic<bool> g_cuda_pinned_arena{false};
+
+// Page-locked host memory for the storage arena. A pageable source forces CUDA
+// to stage every H2D copy through an internal pinned buffer (~8 GB/s); a pinned
+// source is a direct DMA (~36 GB/s measured on the dev box). The arena needs
+// its own alignment, so the allocation is aligned first and then registered.
+void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes) {
+  if (bytes == 0) {
+    return nullptr;
+  }
+  if (alignment < alignof(void*)) {
+    alignment = alignof(void*);
+  }
+#if defined(_WIN32)
+  void* pointer = _aligned_malloc(bytes, alignment);
+#else
+  void* pointer = nullptr;
+  if (posix_memalign(&pointer, alignment, bytes) != 0) {
+    pointer = nullptr;
+  }
+#endif
+  if (pointer == nullptr) {
+    return nullptr;
+  }
+  if (cudaHostRegister(pointer, bytes, cudaHostRegisterDefault) !=
+      cudaSuccess) {
+#if defined(_WIN32)
+    _aligned_free(pointer);
+#else
+    std::free(pointer);
+#endif
+    return nullptr;
+  }
+  g_cuda_pinned_arena.store(true, std::memory_order_relaxed);
+  return pointer;
+}
+
+void cuda_free_pinned(void* pointer) noexcept {
+  if (pointer == nullptr) {
+    return;
+  }
+  static_cast<void>(cudaHostUnregister(pointer));
+#if defined(_WIN32)
+  _aligned_free(pointer);
+#else
+  std::free(pointer);
+#endif
+}
+
+bool cuda_pinned_available() noexcept { return true; }
+
+bool cuda_pinned_arena_active() noexcept {
+  return g_cuda_pinned_arena.load(std::memory_order_relaxed);
+}
+#else
+bool cuda_pinned_available() noexcept { return false; }
+
+bool cuda_pinned_arena_active() noexcept { return false; }
+
+void* cuda_alloc_pinned(std::size_t, std::size_t) { return nullptr; }
+
+void cuda_free_pinned(void*) noexcept {}
+#endif
 
 namespace {
 
@@ -766,6 +838,24 @@ struct CudaMoeExpertCache::Impl {
       throw std::invalid_argument(
           "CUDA expert source does not have the exact raw-v1 span");
     }
+    const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+    if (cuda_pinned_arena_active()) {
+      // The reader arena is page-locked, so the DMA can read straight from it:
+      // no host memcpy and no alternating staging slab.
+      at::Tensor uploaded = at::empty(
+          {kCudaExpertSpan},
+          at::TensorOptions().dtype(at::kByte).device(device));
+      auto ready = std::make_shared<CudaReadyEvent>();
+      const cudaError_t status = cudaMemcpyAsync(
+          uploaded.data_ptr<std::uint8_t>(), source, source_bytes,
+          cudaMemcpyHostToDevice, stream.stream());
+      if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA expert DMA failed: ") +
+                                 cudaGetErrorString(status));
+      }
+      ready->record(stream);
+      return Resident{std::move(uploaded), std::move(ready)};
+    }
     // Two pinned slabs alternate so this host memcpy overlaps the previous
     // expert's still-running DMA instead of serializing every miss behind
     // it. Each slab still waits for its own prior DMA before reuse: host
@@ -790,7 +880,6 @@ struct CudaMoeExpertCache::Impl {
       }
     }
     std::memcpy(pinned.data_ptr<std::uint8_t>(), source, source_bytes);
-    const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
     auto ready = std::make_shared<CudaReadyEvent>();
     at::Tensor uploaded = at::empty(
         {kCudaExpertSpan},

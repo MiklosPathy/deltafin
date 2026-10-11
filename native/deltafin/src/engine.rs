@@ -11,6 +11,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,7 +86,7 @@ use crate::spine_runtime::SpinePipeline;
 use crate::storage_homes::StorageHomes;
 use crate::storage::{
     BufferLengths, BufferRetireHook, CachePolicy, LOOSE_SPINE_DESCRIPTOR_RESERVE, Reader,
-    prepare_persistent_descriptor_capacity,
+    UnifiedBufferHooks, prepare_persistent_descriptor_capacity,
 };
 use crate::tokenizer::K3Tokenizer;
 
@@ -1441,10 +1442,34 @@ impl NativeTargetEngine {
                 Arc::new(move || session.flush_metal_expert_cache()) as BufferRetireHook
             });
         let metal_expert_wrapper_retention = metal_expert_retire_hook.is_some();
-        let mut expert_reader = Reader::with_arena_capacity_and_retire_hook(
+        // On CUDA the storage arena is page-locked (pinned) host memory: the
+        // reader fills it straight from disk and every H2D spine/expert copy
+        // becomes a direct DMA instead of a staged pageable transfer (measured
+        // 36 vs 8 GB/s on the dev box). Every other device keeps the ordinary
+        // Rust-allocated arena.
+        let cuda_pinned_hooks: Option<UnifiedBufferHooks> =
+            matches!(provider.device(), Device::Cuda(_)).then(|| {
+                let session = provider.lease();
+                let allocate_session = Arc::clone(&session);
+                UnifiedBufferHooks {
+                    allocate: Arc::new(move |bytes, alignment| {
+                        let pointer = allocate_session.allocate_pinned(bytes, alignment)?;
+                        NonNull::new(pointer).ok_or_else(|| {
+                            DeltafinError::new(
+                                "CUDA pinned arena allocation returned a null pointer",
+                            )
+                        })
+                    }),
+                    release: Arc::new(move |pointer| {
+                        session.release_pinned(pointer.as_ptr())
+                    }),
+                }
+            });
+        let mut expert_reader = Reader::with_arena_capacity_and_hooks(
             expert_reader_workers,
             EXPERT_ARENA_SLOTS,
             metal_expert_retire_hook.clone(),
+            cuda_pinned_hooks.clone(),
         )?;
         expert_reader.set_storage_homes(storage_homes.clone());
         // The nine-row verifier's compact expert slab is a startup resource,
@@ -1712,12 +1737,13 @@ impl NativeTargetEngine {
         } else {
             spine_reader_workers
         };
-        let mut spine_pipeline = SpinePipeline::with_resident_prefix(
+        let mut spine_pipeline = SpinePipeline::with_resident_prefix_and_hooks(
             spine_reader_workers,
             SPINE_ARENA_SLOTS,
             u32::try_from(residency.resident_layers).map_err(|_| {
                 DeltafinError::new("resident layer prefix does not fit the spine ABI")
             })?,
+            cuda_pinned_hooks.clone(),
         )?;
         spine_pipeline.set_storage_homes(storage_homes.clone());
 

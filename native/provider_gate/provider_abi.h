@@ -1754,6 +1754,26 @@ int32_t deltafin_provider_metal_expert_cache_stats_v1(
     char* error,
     size_t error_capacity);
 
+/*
+ * Page-locked (pinned) host arena allocation for the CUDA provider. The reader
+ * fills the returned buffer straight from disk and the provider's H2D copies
+ * become direct DMAs instead of staged pageable transfers. Requires an open
+ * CUDA provider session; otherwise the caller keeps the pageable arena.
+ */
+int32_t deltafin_provider_alloc_pinned_v1(
+    uint64_t session,
+    uint64_t bytes,
+    uint64_t alignment,
+    void** out_pointer,
+    char* error,
+    size_t error_capacity);
+
+int32_t deltafin_provider_free_pinned_v1(
+    uint64_t session,
+    void* pointer,
+    char* error,
+    size_t error_capacity);
+
 int32_t deltafin_provider_tensor_upload_f32_v1(
     const DeltafinProviderTensorUploadF32V1* request,
     DeltafinProviderTensorReportV1* report,

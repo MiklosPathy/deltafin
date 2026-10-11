@@ -11,7 +11,9 @@ use crate::error::{DeltafinError, Result};
 use crate::program::LayerSpinePlan;
 use crate::provider::{BoundSpineLayerReport, NativeProviderSession, SpineLayerRetention};
 use crate::spine_source_use::{ReclaimAdmission, SpineSourceUseController};
-use crate::storage::{LayerBuffers, ReadPriority, ReadStats, ReadTicket, Reader};
+use crate::storage::{
+    LayerBuffers, ReadPriority, ReadStats, ReadTicket, Reader, UnifiedBufferHooks,
+};
 use std::time::{Duration, Instant};
 
 const K3_LAYER_COUNT: u32 = 93;
@@ -83,6 +85,20 @@ impl SpinePipeline {
         arena_slots: usize,
         resident_prefix_layers: u32,
     ) -> Result<Self> {
+        Self::with_resident_prefix_and_hooks(
+            read_workers,
+            arena_slots,
+            resident_prefix_layers,
+            None,
+        )
+    }
+
+    pub(crate) fn with_resident_prefix_and_hooks(
+        read_workers: usize,
+        arena_slots: usize,
+        resident_prefix_layers: u32,
+        unified: Option<UnifiedBufferHooks>,
+    ) -> Result<Self> {
         if arena_slots < 2 {
             return Err(DeltafinError::new(
                 "spine pipeline needs at least two arena slots for safe read/upload overlap",
@@ -94,7 +110,12 @@ impl SpinePipeline {
             )));
         }
         Ok(Self {
-            reader: Reader::with_arena_capacity(read_workers, arena_slots)?,
+            reader: Reader::with_arena_capacity_and_hooks(
+                read_workers,
+                arena_slots,
+                None,
+                unified,
+            )?,
             pending: None,
             generation: 0,
             resident_prefix_target: resident_prefix_layers,

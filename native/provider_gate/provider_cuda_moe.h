@@ -64,6 +64,23 @@ struct CudaProviderMemorySnapshot {
     const at::Device& device, bool trim_unused);
 
 /*
+ * Page-locked host memory for the CUDA storage arena. A pinned source turns
+ * every H2D spine/expert transfer into a direct DMA instead of a staged
+ * pageable copy. Unavailable without the CUDA provider; callers then keep the
+ * ordinary Rust-allocated (pageable) arena.
+ */
+bool cuda_pinned_available() noexcept;
+void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes);
+void cuda_free_pinned(void* pointer) noexcept;
+
+/*
+ * True once this process has handed out at least one pinned arena slab, so a
+ * borrowed reader-arena view can be marked pinned and its H2D copy becomes a
+ * direct DMA instead of a staged pageable transfer.
+ */
+bool cuda_pinned_arena_active() noexcept;
+
+/*
  * Emitted only after a classified allocator failure and a successful stream
  * drain. Callers must still require an automatic backend request before using
  * the pinned plan for an exact CPU reconstruction.

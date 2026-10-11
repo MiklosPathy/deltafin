@@ -1978,6 +1978,20 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
+    fn deltafin_provider_alloc_pinned_v1(
+        session: u64,
+        bytes: u64,
+        alignment: u64,
+        out_pointer: *mut *mut u8,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn deltafin_provider_free_pinned_v1(
+        session: u64,
+        pointer: *mut u8,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
     fn deltafin_provider_cuda_cache_configure_v1(
         request: *const CudaCacheConfigureRequestV1,
         report: *mut CudaCacheConfigureReportV1,
@@ -3088,6 +3102,68 @@ impl SessionInner {
             0,
             "native Metal expert-cache flush",
         )
+    }
+
+    /// Allocate page-locked (pinned) host memory for the CUDA storage arena.
+    /// The reader fills it straight from disk and every H2D copy becomes a
+    /// direct DMA instead of a staged pageable transfer. Off CUDA this is
+    /// refused; callers keep the pageable arena.
+    pub(crate) fn allocate_pinned(&self, bytes: usize, alignment: usize) -> Result<*mut u8> {
+        if !matches!(self.device, Device::Cuda(_)) {
+            return Err(DeltafinError::new(
+                "pinned arena allocation requires a CUDA provider session",
+            ));
+        }
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| DeltafinError::new("pinned arena size exceeds u64"))?;
+        let alignment = u64::try_from(alignment)
+            .map_err(|_| DeltafinError::new("pinned arena alignment exceeds u64"))?;
+        let mut pointer: *mut u8 = ptr::null_mut();
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: the session handle is retained by `self` and the out-pointer
+        // and error buffer stay writable for this synchronous ABI call.
+        let status = unsafe {
+            deltafin_provider_alloc_pinned_v1(
+                self.handle,
+                bytes,
+                alignment,
+                &mut pointer,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error("native pinned arena allocation", &error));
+        }
+        if pointer.is_null() {
+            return Err(DeltafinError::new(
+                "native pinned arena allocation returned a null pointer",
+            ));
+        }
+        Ok(pointer)
+    }
+
+    /// Release memory returned by `allocate_pinned`. Best-effort: the caller
+    /// runs from a drop path where a failure can only leak a bounded arena.
+    pub(crate) fn release_pinned(&self, pointer: *mut u8) -> Result<()> {
+        if pointer.is_null() {
+            return Ok(());
+        }
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: `pointer` came from `allocate_pinned` on this session and is
+        // released exactly once; the error buffer stays writable.
+        let status = unsafe {
+            deltafin_provider_free_pinned_v1(
+                self.handle,
+                pointer,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error("native pinned arena release", &error));
+        }
+        Ok(())
     }
 
     pub(crate) fn metal_expert_cache_stats(&self) -> Result<MetalExpertCacheStats> {

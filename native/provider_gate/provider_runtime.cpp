@@ -1549,8 +1549,13 @@ at::Tensor upload_direct_spine_run(
   }
   const auto* source =
       spine_component_pointer(request, run.buffer, run.begin);
-  const auto cpu_options =
+  auto cpu_options =
       at::TensorOptions().dtype(run.source_type).device(at::kCPU);
+  if (deltafin::provider_internal::cuda_pinned_arena_active()) {
+    // The reader arena is page-locked; telling the borrowed view keeps the
+    // blocking H2D copy on CUDA's direct-DMA fast path.
+    cpu_options = cpu_options.pinned_memory(true);
+  }
   if (device.is_mps() && run.source_type == at::kUInt16 &&
       run.target_type == at::kUInt16) {
     // PyTorch/MPS may encode a nominally blocking host-to-device copy by
@@ -1589,9 +1594,13 @@ at::Tensor upload_gathered_spine_run(
     throw std::logic_error("invalid gathered spine upload run");
   }
   const std::uint64_t width = spine_scalar_width(run.source_type);
+  auto gathered_options =
+      at::TensorOptions().dtype(run.source_type).device(at::kCPU);
+  if (deltafin::provider_internal::cuda_pinned_arena_active()) {
+    gathered_options = gathered_options.pinned_memory(true);
+  }
   const at::Tensor owned_cpu = at::empty(
-      {static_cast<std::int64_t>(run.elements)},
-      at::TensorOptions().dtype(run.source_type).device(at::kCPU));
+      {static_cast<std::int64_t>(run.elements)}, gathered_options);
   auto* destination =
       static_cast<std::uint8_t*>(owned_cpu.mutable_data_ptr());
   for (std::size_t offset = 0; offset < run.component_count; ++offset) {
@@ -4219,6 +4228,58 @@ extern "C" int32_t deltafin_provider_metal_expert_cache_flush_v1(
           "Metal expert-cache flush requires the selected MPS provider");
     }
     deltafin::provider_internal::flush_metal_expert_cache();
+  });
+}
+
+extern "C" int32_t deltafin_provider_alloc_pinned_v1(
+    const uint64_t session_handle, const uint64_t bytes,
+    const uint64_t alignment, void** out_pointer, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (out_pointer == nullptr) {
+      throw std::invalid_argument(
+          "provider pinned allocation needs an out pointer");
+    }
+    *out_pointer = nullptr;
+    if (bytes == 0) {
+      throw std::invalid_argument(
+          "provider pinned allocation needs a non-zero size");
+    }
+    const auto session = find_session(session_handle);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    if (!session->selected.device.is_cuda()) {
+      throw std::invalid_argument(
+          "provider pinned allocation requires the selected CUDA provider");
+    }
+    if (!deltafin::provider_internal::cuda_pinned_available()) {
+      throw std::runtime_error(
+          "provider pinned allocation needs the CUDA provider");
+    }
+    void* pointer = deltafin::provider_internal::cuda_alloc_pinned(
+        static_cast<std::size_t>(alignment), static_cast<std::size_t>(bytes));
+    if (pointer == nullptr) {
+      throw std::runtime_error("CUDA pinned arena allocation failed");
+    }
+    *out_pointer = pointer;
+  });
+}
+
+extern "C" int32_t deltafin_provider_free_pinned_v1(
+    const uint64_t session_handle, void* pointer, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (pointer == nullptr) {
+      return;
+    }
+    const auto session = find_session(session_handle);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    if (!session->selected.device.is_cuda()) {
+      throw std::invalid_argument(
+          "provider pinned release requires the selected CUDA provider");
+    }
+    deltafin::provider_internal::cuda_free_pinned(pointer);
   });
 }
 
