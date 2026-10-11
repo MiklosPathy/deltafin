@@ -1551,7 +1551,7 @@ at::Tensor upload_direct_spine_run(
       spine_component_pointer(request, run.buffer, run.begin);
   auto cpu_options =
       at::TensorOptions().dtype(run.source_type).device(at::kCPU);
-  if (deltafin::provider_internal::cuda_pinned_arena_active()) {
+  if (deltafin::provider_internal::cuda_spine_arena_pinned()) {
     // The reader arena is page-locked; telling the borrowed view keeps the
     // blocking H2D copy on CUDA's direct-DMA fast path.
     cpu_options = cpu_options.pinned_memory(true);
@@ -1596,7 +1596,7 @@ at::Tensor upload_gathered_spine_run(
   const std::uint64_t width = spine_scalar_width(run.source_type);
   auto gathered_options =
       at::TensorOptions().dtype(run.source_type).device(at::kCPU);
-  if (deltafin::provider_internal::cuda_pinned_arena_active()) {
+  if (deltafin::provider_internal::cuda_spine_arena_pinned()) {
     gathered_options = gathered_options.pinned_memory(true);
   }
   const at::Tensor owned_cpu = at::empty(
@@ -4233,8 +4233,8 @@ extern "C" int32_t deltafin_provider_metal_expert_cache_flush_v1(
 
 extern "C" int32_t deltafin_provider_alloc_pinned_v1(
     const uint64_t session_handle, const uint64_t bytes,
-    const uint64_t alignment, void** out_pointer, char* error,
-    const size_t error_capacity) {
+    const uint64_t alignment, const uint64_t kind, void** out_pointer,
+    char* error, const size_t error_capacity) {
   return ffi_guard(error, error_capacity, [&] {
     if (out_pointer == nullptr) {
       throw std::invalid_argument(
@@ -4256,8 +4256,12 @@ extern "C" int32_t deltafin_provider_alloc_pinned_v1(
       throw std::runtime_error(
           "provider pinned allocation needs the CUDA provider");
     }
+    if (kind > 1) {
+      throw std::invalid_argument("provider pinned allocation has an unknown arena kind");
+    }
     void* pointer = deltafin::provider_internal::cuda_alloc_pinned(
-        static_cast<std::size_t>(alignment), static_cast<std::size_t>(bytes));
+        static_cast<std::size_t>(alignment), static_cast<std::size_t>(bytes),
+        static_cast<std::uint32_t>(kind));
     if (pointer == nullptr) {
       throw std::runtime_error("CUDA pinned arena allocation failed");
     }

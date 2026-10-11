@@ -1982,6 +1982,7 @@ unsafe extern "C" {
         session: u64,
         bytes: u64,
         alignment: u64,
+        kind: u64,
         out_pointer: *mut *mut u8,
         error: *mut c_char,
         error_capacity: usize,
@@ -3108,7 +3109,12 @@ impl SessionInner {
     /// The reader fills it straight from disk and every H2D copy becomes a
     /// direct DMA instead of a staged pageable transfer. Off CUDA this is
     /// refused; callers keep the pageable arena.
-    pub(crate) fn allocate_pinned(&self, bytes: usize, alignment: usize) -> Result<*mut u8> {
+    pub(crate) fn allocate_pinned(
+        &self,
+        bytes: usize,
+        alignment: usize,
+        kind: u64,
+    ) -> Result<*mut u8> {
         if !matches!(self.device, Device::Cuda(_)) {
             return Err(DeltafinError::new(
                 "pinned arena allocation requires a CUDA provider session",
@@ -3127,6 +3133,7 @@ impl SessionInner {
                 self.handle,
                 bytes,
                 alignment,
+                kind,
                 &mut pointer,
                 error.as_mut_ptr(),
                 error.len(),

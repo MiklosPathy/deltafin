@@ -64,13 +64,15 @@ int k3_cuda_moe_launch(const std::uint8_t* expert_span, const float* x,
 namespace deltafin::provider_internal {
 
 #if defined(DELTAFIN_HAVE_CUDA_PROVIDER_V1)
-std::atomic<bool> g_cuda_pinned_arena{false};
+std::atomic<bool> g_cuda_spine_pinned{false};
+std::atomic<bool> g_cuda_expert_pinned{false};
 
 // Page-locked host memory for the storage arena. A pageable source forces CUDA
 // to stage every H2D copy through an internal pinned buffer (~8 GB/s); a pinned
 // source is a direct DMA (~36 GB/s measured on the dev box). The arena needs
 // its own alignment, so the allocation is aligned first and then registered.
-void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes) {
+void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes,
+                        std::uint32_t kind) {
   if (bytes == 0) {
     return nullptr;
   }
@@ -97,7 +99,11 @@ void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes) {
 #endif
     return nullptr;
   }
-  g_cuda_pinned_arena.store(true, std::memory_order_relaxed);
+  if (kind == 1) {
+    g_cuda_expert_pinned.store(true, std::memory_order_relaxed);
+  } else {
+    g_cuda_spine_pinned.store(true, std::memory_order_relaxed);
+  }
   return pointer;
 }
 
@@ -115,15 +121,23 @@ void cuda_free_pinned(void* pointer) noexcept {
 
 bool cuda_pinned_available() noexcept { return true; }
 
-bool cuda_pinned_arena_active() noexcept {
-  return g_cuda_pinned_arena.load(std::memory_order_relaxed);
+bool cuda_spine_arena_pinned() noexcept {
+  return g_cuda_spine_pinned.load(std::memory_order_relaxed);
+}
+
+bool cuda_expert_arena_pinned() noexcept {
+  return g_cuda_expert_pinned.load(std::memory_order_relaxed);
 }
 #else
 bool cuda_pinned_available() noexcept { return false; }
 
-bool cuda_pinned_arena_active() noexcept { return false; }
+bool cuda_spine_arena_pinned() noexcept { return false; }
 
-void* cuda_alloc_pinned(std::size_t, std::size_t) { return nullptr; }
+bool cuda_expert_arena_pinned() noexcept { return false; }
+
+void* cuda_alloc_pinned(std::size_t, std::size_t, std::uint32_t) {
+  return nullptr;
+}
 
 void cuda_free_pinned(void*) noexcept {}
 #endif
@@ -839,7 +853,7 @@ struct CudaMoeExpertCache::Impl {
           "CUDA expert source does not have the exact raw-v1 span");
     }
     const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
-    if (cuda_pinned_arena_active()) {
+    if (cuda_expert_arena_pinned()) {
       // The reader arena is page-locked, so the DMA can read straight from it:
       // no host memcpy and no alternating staging slab.
       at::Tensor uploaded = at::empty(

@@ -1760,10 +1760,13 @@ int32_t deltafin_provider_metal_expert_cache_stats_v1(
  * become direct DMAs instead of staged pageable transfers. Requires an open
  * CUDA provider session; otherwise the caller keeps the pageable arena.
  */
+/* `kind` selects the arena whose pinned flag the provider records: 0 = spine,
+ * 1 = expert. The two are tracked separately so one may stay pageable. */
 int32_t deltafin_provider_alloc_pinned_v1(
     uint64_t session,
     uint64_t bytes,
     uint64_t alignment,
+    uint64_t kind,
     void** out_pointer,
     char* error,
     size_t error_capacity);

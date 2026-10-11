@@ -70,15 +70,19 @@ struct CudaProviderMemorySnapshot {
  * ordinary Rust-allocated (pageable) arena.
  */
 bool cuda_pinned_available() noexcept;
-void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes);
+/* `kind` 0 = spine arena, 1 = expert arena. */
+void* cuda_alloc_pinned(std::size_t alignment, std::size_t bytes,
+                        std::uint32_t kind);
 void cuda_free_pinned(void* pointer) noexcept;
 
 /*
- * True once this process has handed out at least one pinned arena slab, so a
- * borrowed reader-arena view can be marked pinned and its H2D copy becomes a
- * direct DMA instead of a staged pageable transfer.
+ * True once this process has handed out at least one pinned slab for the given
+ * arena, so a borrowed reader-arena view can be marked pinned and its H2D copy
+ * becomes a direct DMA instead of a staged pageable transfer. The spine and
+ * expert arenas are tracked separately.
  */
-bool cuda_pinned_arena_active() noexcept;
+bool cuda_spine_arena_pinned() noexcept;
+bool cuda_expert_arena_pinned() noexcept;
 
 /*
  * Emitted only after a classified allocator failure and a successful stream

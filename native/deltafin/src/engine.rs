@@ -1446,14 +1446,18 @@ impl NativeTargetEngine {
         // reader fills it straight from disk and every H2D spine/expert copy
         // becomes a direct DMA instead of a staged pageable transfer (measured
         // 36 vs 8 GB/s on the dev box). Every other device keeps the ordinary
-        // Rust-allocated arena.
-        let cuda_pinned_hooks: Option<UnifiedBufferHooks> =
-            matches!(provider.device(), Device::Cuda(_)).then(|| {
+        // Rust-allocated arena. The spine (kind 0) and expert (kind 1) arenas
+        // are tracked separately; `K3_CUDA_PIN_EXPERTS=0` keeps the expert
+        // arena pageable for A/B measurement.
+        let cuda_pinned_arena = matches!(provider.device(), Device::Cuda(_));
+        let make_pinned_hooks = |kind: u64| -> Option<UnifiedBufferHooks> {
+            cuda_pinned_arena.then(|| {
                 let session = provider.lease();
                 let allocate_session = Arc::clone(&session);
                 UnifiedBufferHooks {
                     allocate: Arc::new(move |bytes, alignment| {
-                        let pointer = allocate_session.allocate_pinned(bytes, alignment)?;
+                        let pointer =
+                            allocate_session.allocate_pinned(bytes, alignment, kind)?;
                         NonNull::new(pointer).ok_or_else(|| {
                             DeltafinError::new(
                                 "CUDA pinned arena allocation returned a null pointer",
@@ -1464,12 +1468,18 @@ impl NativeTargetEngine {
                         session.release_pinned(pointer.as_ptr())
                     }),
                 }
-            });
+            })
+        };
+        let cuda_spine_hooks = make_pinned_hooks(0);
+        let cuda_expert_hooks = std::env::var("K3_CUDA_PIN_EXPERTS")
+            .map_or(true, |value| value != "0")
+            .then(|| make_pinned_hooks(1))
+            .flatten();
         let mut expert_reader = Reader::with_arena_capacity_and_hooks(
             expert_reader_workers,
             EXPERT_ARENA_SLOTS,
             metal_expert_retire_hook.clone(),
-            cuda_pinned_hooks.clone(),
+            cuda_expert_hooks,
         )?;
         expert_reader.set_storage_homes(storage_homes.clone());
         // The nine-row verifier's compact expert slab is a startup resource,
@@ -1743,7 +1753,7 @@ impl NativeTargetEngine {
             u32::try_from(residency.resident_layers).map_err(|_| {
                 DeltafinError::new("resident layer prefix does not fit the spine ABI")
             })?,
-            cuda_pinned_hooks.clone(),
+            cuda_spine_hooks,
         )?;
         spine_pipeline.set_storage_homes(storage_homes.clone());
 
